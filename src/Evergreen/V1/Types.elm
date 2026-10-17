@@ -18,13 +18,8 @@ type alias LoginForm =
     }
 
 
-type User
-    = UserOne
-    | UserTwo
-
-
 type alias PrivateData =
-    { user : User
+    { user : Evergreen.V1.Domain.User
     , board : Evergreen.V1.Domain.Board
     }
 
@@ -50,15 +45,22 @@ type LoginState
     | SigningOut
 
 
+type Theme
+    = SystemTheme
+    | LightTheme
+    | DarkTheme
+
+
 type alias FrontendModel =
     { key : Browser.Navigation.Key
     , login : LoginState
     , nextRequest : Int
+    , theme : Theme
     }
 
 
 type alias Session =
-    { user : User
+    { user : Evergreen.V1.Domain.User
     , keyHash : String
     }
 
@@ -78,6 +80,7 @@ type FrontendMsg
     | PasswordChanged String
     | SignIn
     | SignOut
+    | ThemeChanged Theme
     | BoardMsg Evergreen.V1.Dashboard.Msg
     | ImportBackup
     | BackupSelected Int File.File

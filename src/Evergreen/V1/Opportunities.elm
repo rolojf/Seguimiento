@@ -4,11 +4,15 @@ import Browser.Dom
 import Evergreen.V1.Domain
 
 
+type ViewStatus
+    = ActiveOnly
+    | DiscardedOnly
+
+
 type Panel
     = Closed
     | Detail String
     | Editor Evergreen.V1.Domain.Target Evergreen.V1.Domain.OpportunityFields
-    | ConfirmRemoval Evergreen.V1.Domain.Ref
 
 
 type Intent
@@ -48,6 +52,7 @@ type DragState
 type alias Model =
     { category : Maybe Evergreen.V1.Domain.Category
     , kind : Maybe Evergreen.V1.Domain.Kind
+    , status : ViewStatus
     , panel : Panel
     , request : Request
     , undo : Maybe String
@@ -90,6 +95,7 @@ type Step
 type Msg
     = FilterCategory (Maybe Evergreen.V1.Domain.Category)
     | FilterKind (Maybe Evergreen.V1.Domain.Kind)
+    | FilterStatus ViewStatus
     | Select String
     | Add
     | Edit String
@@ -101,10 +107,10 @@ type Msg
     | SetRating Axis Evergreen.V1.Domain.Rating
     | SetValidation Validation
     | Save
-    | Validate String
-    | AskRemove String
-    | Remove
-    | Undo
+    | Validate Evergreen.V1.Domain.Ref
+    | Confirm Evergreen.V1.Domain.Ref
+    | Discard Evergreen.V1.Domain.Ref
+    | Restore Evergreen.V1.Domain.Ref
     | DismissUndo
     | StartDrag String Int Point
     | GotBounds Int (Result Browser.Dom.Error Browser.Dom.Element)

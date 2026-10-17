@@ -1,8 +1,9 @@
 module Access exposing (user, verify)
 
 import Crypto.Hash
+import Domain exposing (User(..))
 import Env
-import Types exposing (Session, User(..))
+import Types exposing (Session)
 
 
 verify : String -> String -> Maybe Session

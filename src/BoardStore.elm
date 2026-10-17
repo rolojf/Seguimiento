@@ -21,11 +21,6 @@ contextLimit =
     240
 
 
-reasonLimit : Int
-reasonLimit =
-    600
-
-
 offsetLimit : Float
 offsetLimit =
     0.32
@@ -54,22 +49,22 @@ templateVersion =
 -- Every accepted command advances one board revision; rejected commands change nothing.
 
 
-apply : String -> Change -> Board -> Result String Board
-apply now change board =
+apply : User -> String -> Change -> Board -> Result String Board
+apply actor now change board =
     if not (validTimestamp now) then
         Err "La fecha del servidor no es válida."
 
     else
-        changeBoard now change board
+        changeBoard actor now change board
             |> Result.map (\updated -> { updated | revision = board.revision + 1 })
 
 
-changeBoard : String -> Change -> Board -> Result String Board
-changeBoard now change board =
+changeBoard : User -> String -> Change -> Board -> Result String Board
+changeBoard actor now change board =
     case change of
         SaveOpportunity target fields ->
             validateOpportunity fields
-                |> Result.andThen (\_ -> saveOpportunity now target fields board)
+                |> Result.andThen (\_ -> saveOpportunity actor now target fields board)
 
         MoveOpportunity reference placement ->
             if validOffset placement.dx && validOffset placement.dy then
@@ -88,19 +83,13 @@ changeBoard now change board =
                 Err "El desplazamiento debe estar entre -0.32 y 0.32."
 
         ValidateOpportunity reference ->
-            changeOpportunity now
-                reference
-                (\item ->
-                    let
-                        fields =
-                            item.fields
-                    in
-                    { item | fields = { fields | proposed = False } }
-                )
-                board
+            validateProposal actor now reference board
+
+        ConfirmOpportunity reference ->
+            confirmOpportunity actor now reference board
 
         RemoveOpportunity reference ->
-            changeOpportunity now reference (\item -> { item | deleted = True }) board
+            changeOpportunity now reference (\item -> { item | deleted = True, review = Reviewed }) board
 
         RestoreOpportunity reference ->
             current reference board.opportunities
@@ -113,35 +102,38 @@ changeBoard now change board =
                             Err "El registro ya está activo."
                     )
 
-        SavePending target fields ->
+        SavePending target fields move ->
             validatePending fields
-                |> Result.andThen (\_ -> savePending now target fields board)
+                |> Result.andThen (\_ -> savePending actor now target fields move board)
+
+        MovePending reference shift ->
+            movePending now reference shift board
 
         CompletePending reference completion ->
-            changePending now
-                reference
-                (\item ->
-                    let
-                        fields =
-                            item.fields
-                    in
-                    { item | fields = { fields | completion = completion } }
-                )
-                board
+            completePending now reference completion board
+
+        ConfirmPending reference ->
+            confirmPending actor reference board
 
         RemovePending reference ->
-            changePending now reference (\item -> { item | deleted = True }) board
+            discardPending now reference board
+
+        RestorePending reference ->
+            restorePending now reference board
+
+        PurgePending reference ->
+            purgePending reference board
 
         CreateProcess fields ->
             validateProcess fields
                 |> Result.map (\_ -> createProcess now fields board)
 
         ChangeTask reference taskId changeTask ->
-            changeProcess now reference taskId changeTask board
+            changeProcess actor now reference taskId changeTask board
 
 
-saveOpportunity : String -> Target -> OpportunityFields -> Board -> Result String Board
-saveOpportunity now target fields board =
+saveOpportunity : User -> String -> Target -> OpportunityFields -> Board -> Result String Board
+saveOpportunity actor now target fields board =
     case target of
         Existing reference ->
             changeOpportunity now
@@ -168,26 +160,289 @@ saveOpportunity now target fields board =
                     nextOffset fields Nothing board
 
                 item =
-                    Opportunity id fields offset.dx offset.dy False initialVersion now now
+                    Opportunity id fields offset.dx offset.dy False initialVersion now now (NeedsReview (otherUser actor))
             in
             Ok { board | opportunities = Dict.insert id item board.opportunities, nextId = nextId }
 
 
-savePending : String -> Target -> PendingFields -> Board -> Result String Board
-savePending now target fields board =
-    case target of
-        Existing reference ->
-            changePending now reference (\item -> { item | fields = fields }) board
+savePending : User -> String -> Target -> PendingFields -> PendingMove -> Board -> Result String Board
+savePending actor now target fields move board =
+    checkPendingMove move board
+        |> Result.andThen
+            (\_ ->
+                case target of
+                    Existing reference ->
+                        active reference board.pending
+                            |> Result.map
+                                (\item ->
+                                    let
+                                        edited =
+                                            touch now
+                                                { item
+                                                    | fields = fields
+                                                    , position =
+                                                        if item.fields.owner == fields.owner then
+                                                            item.position
 
-        New ->
+                                                        else
+                                                            List.length (orderedPending fields.owner board)
+                                                }
+
+                                        saved =
+                                            { board | pending = Dict.insert item.id edited board.pending }
+
+                                        relocated =
+                                            if item.fields.owner == fields.owner then
+                                                saved
+
+                                            else
+                                                saved |> normalizePending item.fields.owner |> normalizePending fields.owner
+                                    in
+                                    shiftIfRequested move edited relocated
+                                )
+
+                    New ->
+                        let
+                            ( id, nextId ) =
+                                freshId board
+
+                            item =
+                                Pending id fields False initialVersion now now (NeedsReview (otherUser actor)) (List.length (orderedPending fields.owner board))
+
+                            saved =
+                                { board | pending = Dict.insert id item board.pending, nextId = nextId }
+                        in
+                        Ok (shiftIfRequested move item saved)
+            )
+        |> Result.map (advancePendingOrder board)
+
+
+completePending : String -> Ref -> Completion -> Board -> Result String Board
+completePending now reference completion board =
+    active reference board.pending
+        |> Result.andThen
+            (\item ->
+                case item.fields.content of
+                    Separator _ ->
+                        Err "Un separador no se puede marcar como completado."
+
+                    PendingTask title _ ->
+                        let
+                            fields =
+                                item.fields
+                        in
+                        changePending now reference (\currentItem -> { currentItem | fields = { fields | content = PendingTask title completion } }) board
+            )
+
+
+discardPending : String -> Ref -> Board -> Result String Board
+discardPending now reference board =
+    active reference board.pending
+        |> Result.map
+            (\item ->
+                { board | pending = Dict.insert item.id (touch now { item | deleted = True, review = Reviewed }) board.pending }
+                    |> normalizePending item.fields.owner
+                    |> advancePendingOrder board
+            )
+
+
+restorePending : String -> Ref -> Board -> Result String Board
+restorePending now reference board =
+    current reference board.pending
+        |> Result.andThen
+            (\item ->
+                if item.deleted then
+                    let
+                        restored =
+                            touch now { item | deleted = False, position = List.length (orderedPending item.fields.owner board) }
+                    in
+                    Ok
+                        ({ board | pending = Dict.insert item.id restored board.pending }
+                            |> advancePendingOrder board
+                        )
+
+                else
+                    Err "El pendiente ya está activo."
+            )
+
+
+purgePending : Ref -> Board -> Result String Board
+purgePending reference board =
+    current reference board.pending
+        |> Result.andThen
+            (\item ->
+                if item.deleted then
+                    -- Keep nextId unchanged: deleting a record never makes its identifier reusable.
+                    Ok { board | pending = Dict.remove item.id board.pending, pendingOrderRevision = board.pendingOrderRevision + 1 }
+
+                else
+                    Err "Descarta el pendiente antes de borrarlo definitivamente."
+            )
+
+
+movePending : String -> Ref -> PendingShift -> Board -> Result String Board
+movePending now reference shift board =
+    active reference board.pending
+        |> Result.andThen
+            (\item ->
+                checkPendingMove (ShiftPosition shift) board
+                    |> Result.map
+                        (\_ ->
+                            let
+                                moved =
+                                    shiftPending item shift.steps board |> advancePendingOrder board
+                            in
+                            if moved.pendingOrderRevision == board.pendingOrderRevision then
+                                moved
+
+                            else
+                                { moved | pending = Dict.update item.id (Maybe.map (touch now)) moved.pending }
+                        )
+            )
+
+
+checkPendingMove : PendingMove -> Board -> Result String ()
+checkPendingMove move board =
+    case move of
+        KeepPosition ->
+            Ok ()
+
+        ShiftPosition shift ->
+            if shift.revision == board.pendingOrderRevision then
+                Ok ()
+
+            else
+                Err "El orden de pendientes cambió. Revisa la lista antes de volver a mover el elemento."
+
+
+shiftIfRequested : PendingMove -> Pending -> Board -> Board
+shiftIfRequested move item board =
+    case move of
+        KeepPosition ->
+            board
+
+        ShiftPosition shift ->
+            shiftPending item shift.steps board
+
+
+
+-- Move IDs only; reindexing must never overwrite a neighbour's content or review.
+
+
+shiftPending : Pending -> Int -> Board -> Board
+shiftPending item steps board =
+    let
+        ids =
+            orderedPending item.fields.owner board |> List.map .id
+
+        position =
+            ids |> List.indexedMap Tuple.pair |> List.filter (\( _, id ) -> id == item.id) |> List.head |> Maybe.map Tuple.first
+    in
+    case position of
+        Nothing ->
+            board
+
+        Just previous ->
             let
-                ( id, nextId ) =
-                    freshId board
+                destination =
+                    clamp 0 (List.length ids - 1) (previous - steps)
 
-                item =
-                    Pending id fields False initialVersion now now
+                remaining =
+                    List.filter ((/=) item.id) ids
             in
-            Ok { board | pending = Dict.insert id item board.pending, nextId = nextId }
+            if destination == previous then
+                board
+
+            else
+                setPendingOrder (List.take destination remaining ++ [ item.id ] ++ List.drop destination remaining) board
+
+
+normalizePending : Owner -> Board -> Board
+normalizePending owner board =
+    setPendingOrder (orderedPending owner board |> List.map .id) board
+
+
+setPendingOrder : List String -> Board -> Board
+setPendingOrder ids board =
+    { board
+        | pending =
+            ids
+                |> List.indexedMap Tuple.pair
+                |> List.foldl
+                    (\( position, id ) items -> Dict.update id (Maybe.map (\item -> { item | position = position })) items)
+                    board.pending
+    }
+
+
+advancePendingOrder : Board -> Board -> Board
+advancePendingOrder previous updated =
+    let
+        order board =
+            List.map (\owner -> orderedPending owner board |> List.map .id) [ Rolando, Dot, Others ]
+    in
+    if order previous == order updated then
+        updated
+
+    else
+        { updated | pendingOrderRevision = previous.pendingOrderRevision + 1 }
+
+
+validateProposal : User -> String -> Ref -> Board -> Result String Board
+validateProposal actor now reference board =
+    active reference board.opportunities
+        |> Result.andThen
+            (\item ->
+                case item.review of
+                    NeedsReview _ ->
+                        confirmOpportunity actor now reference board
+
+                    Reviewed ->
+                        changeOpportunity now reference markValidated board
+            )
+
+
+confirmOpportunity : User -> String -> Ref -> Board -> Result String Board
+confirmOpportunity actor now reference board =
+    active reference board.opportunities
+        |> Result.andThen
+            (\item ->
+                requireReview actor item.review
+                    |> Result.map
+                        (\_ ->
+                            { board | opportunities = Dict.insert item.id (touch now (markValidated item)) board.opportunities }
+                        )
+            )
+
+
+markValidated : Opportunity -> Opportunity
+markValidated item =
+    let
+        fields =
+            item.fields
+    in
+    { item | fields = { fields | proposed = False }, review = Reviewed }
+
+
+confirmPending : User -> Ref -> Board -> Result String Board
+confirmPending actor reference board =
+    active reference board.pending
+        |> Result.andThen
+            (\item ->
+                requireReview actor item.review
+                    |> Result.map
+                        (\_ ->
+                            { board | pending = Dict.insert item.id { item | review = Reviewed, version = item.version + 1 } board.pending }
+                        )
+            )
+
+
+requireReview : User -> Review -> Result String ()
+requireReview actor review =
+    if review == NeedsReview actor then
+        Ok ()
+
+    else
+        Err "No hay una confirmación pendiente para este usuario."
 
 
 createProcess : String -> ProcessFields -> Board -> Board
@@ -198,7 +453,7 @@ createProcess now fields board =
 
         states =
             tasks fields.kind
-                |> List.map (\task -> ( task.id, TaskState (Applicable Todo) Nothing ))
+                |> List.map (\task -> ( task.id, TaskState (Applicable Todo) Nothing Reviewed Reviewed ))
                 |> Dict.fromList
 
         item =
@@ -276,17 +531,33 @@ changePending now reference update board =
             (\item -> { board | pending = Dict.insert item.id (touch now (update item)) board.pending })
 
 
-changeProcess : String -> Ref -> String -> TaskChange -> Board -> Result String Board
-changeProcess now reference taskId change board =
+changeProcess : User -> String -> Ref -> String -> TaskChange -> Board -> Result String Board
+changeProcess actor now reference taskId change board =
     current reference board.processes
         |> Result.andThen
             (\process ->
                 case ( List.filter (\task -> task.id == taskId) (tasks process.fields.kind), Dict.get taskId process.states ) of
                     ( [ task ], Just state ) ->
-                        updateTask task change state
+                        updateTask actor task change state
                             |> Result.map
                                 (\updated ->
-                                    { board | processes = Dict.insert process.id (touch now { process | states = Dict.insert taskId updated process.states }) board.processes }
+                                    let
+                                        -- Recognizing an alert changes its version, not the business timestamp.
+                                        updatedAt =
+                                            if updated.applicability == state.applicability then
+                                                process.updatedAt
+
+                                            else
+                                                now
+
+                                        changed =
+                                            { process
+                                                | states = Dict.insert taskId updated process.states
+                                                , version = process.version + 1
+                                                , updatedAt = updatedAt
+                                            }
+                                    in
+                                    { board | processes = Dict.insert process.id changed board.processes }
                                 )
 
                     _ ->
@@ -298,38 +569,112 @@ changeProcess now reference taskId change board =
 -- Evidence and personal closure remain independent of task completion.
 
 
-updateTask : Task -> TaskChange -> TaskState -> Result String TaskState
-updateTask task change state =
+updateTask : User -> Task -> TaskChange -> TaskState -> Result String TaskState
+updateTask actor task change state =
     case change of
         SetCompletion completion ->
-            Ok { state | applicability = Applicable completion }
-
-        ExcludeTask reason ->
-            if not task.allowNotApplicable then
-                Err "Este paso no permite marcar No aplica."
-
-            else if String.length (String.trim reason) > reasonLimit then
-                Err "El motivo de No aplica admite hasta 600 caracteres."
-
-            else
-                let
-                    previous =
+            canChange actor state.completionReview
+                |> Result.andThen
+                    (\_ ->
                         case state.applicability of
-                            Applicable completion ->
-                                completion
+                            NotApplicable _ ->
+                                Err "Restaura el paso antes de cambiar su confirmación."
 
-                            NotApplicable completion _ ->
-                                completion
-                in
-                Ok { state | applicability = NotApplicable previous (String.trim reason) }
+                            Applicable previous ->
+                                if previous == completion then
+                                    Ok state
+
+                                else
+                                    Ok
+                                        { state
+                                            | applicability = Applicable completion
+                                            , completionReview = NeedsReview (otherUser actor)
+                                        }
+                    )
+
+        ExcludeTask ->
+            canChange actor state.applicabilityReview
+                |> Result.andThen
+                    (\_ ->
+                        if not task.allowNotApplicable then
+                            Err "Este paso no permite marcar No aplica."
+
+                        else
+                            case state.applicability of
+                                NotApplicable _ ->
+                                    Ok state
+
+                                Applicable previous ->
+                                    Ok
+                                        { state
+                                            | applicability = NotApplicable previous
+                                            , applicabilityReview = NeedsReview (otherUser actor)
+                                        }
+                    )
 
         RestoreTask ->
-            case state.applicability of
-                Applicable _ ->
-                    Ok state
+            canChange actor state.applicabilityReview
+                |> Result.map
+                    (\_ ->
+                        case state.applicability of
+                            Applicable _ ->
+                                state
 
-                NotApplicable previous _ ->
-                    Ok { state | applicability = Applicable previous }
+                            NotApplicable previous ->
+                                { state
+                                    | applicability = Applicable previous
+                                    , applicabilityReview = NeedsReview (otherUser actor)
+                                }
+                    )
+
+        Acknowledge checkbox ->
+            acknowledge actor checkbox state
+
+
+canChange : User -> Review -> Result String ()
+canChange actor review =
+    if review == NeedsReview actor then
+        Err "Primero reconoce el cambio del otro usuario en esta casilla."
+
+    else
+        Ok ()
+
+
+
+-- Each control has its own recipient; acknowledgement never notifies the author.
+
+
+acknowledge : User -> Checkbox -> TaskState -> Result String TaskState
+acknowledge actor checkbox state =
+    let
+        review =
+            case checkbox of
+                ApplicabilityBox ->
+                    state.applicabilityReview
+
+                CompletionBox ->
+                    state.completionReview
+    in
+    if review /= NeedsReview actor then
+        Err "Esta casilla no tiene un cambio pendiente de tu reconocimiento."
+
+    else
+        case checkbox of
+            ApplicabilityBox ->
+                Ok { state | applicabilityReview = Reviewed }
+
+            CompletionBox ->
+                Ok { state | completionReview = Reviewed }
+
+
+otherUser : User -> User
+otherUser user =
+    case user of
+        UserOne ->
+            UserTwo
+
+        UserTwo ->
+            UserOne
 
 
 current : Ref -> Dict String { a | id : String, version : Int } -> Result String { a | id : String, version : Int }
@@ -403,11 +748,20 @@ validateOpportunity fields =
 
 validatePending : PendingFields -> Result String ()
 validatePending fields =
-    if validTitle fields.title then
-        Ok ()
+    case fields.content of
+        PendingTask title _ ->
+            if validTitle title then
+                Ok ()
 
-    else
-        Err "El pendiente es obligatorio y admite hasta 90 caracteres."
+            else
+                Err "El pendiente es obligatorio y admite hasta 90 caracteres."
+
+        Separator title ->
+            if String.length title <= titleLimit then
+                Ok ()
+
+            else
+                Err "El separador admite hasta 90 caracteres."
 
 
 validateProcess : ProcessFields -> Result String ()

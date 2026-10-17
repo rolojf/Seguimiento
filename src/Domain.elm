@@ -3,6 +3,21 @@ module Domain exposing (..)
 import Dict exposing (Dict)
 
 
+type User
+    = UserOne
+    | UserTwo
+
+
+type Review
+    = Reviewed
+    | NeedsReview User
+
+
+type Checkbox
+    = ApplicabilityBox
+    | CompletionBox
+
+
 type Category
     = Ventex
     | Contractor
@@ -39,7 +54,7 @@ type ProcessKind
 
 type Applicability
     = Applicable Completion
-    | NotApplicable Completion String
+    | NotApplicable Completion
 
 
 type Closure
@@ -87,11 +102,26 @@ type alias Opportunity =
     , version : Int
     , createdAt : String
     , updatedAt : String
+    , review : Review
     }
 
 
+type PendingContent
+    = PendingTask String Completion
+    | Separator String
+
+
 type alias PendingFields =
-    { title : String, owner : Owner, completion : Completion }
+    { content : PendingContent, owner : Owner }
+
+
+type alias PendingShift =
+    { revision : Int, steps : Int }
+
+
+type PendingMove
+    = KeepPosition
+    | ShiftPosition PendingShift
 
 
 type alias Pending =
@@ -101,6 +131,8 @@ type alias Pending =
     , version : Int
     , createdAt : String
     , updatedAt : String
+    , review : Review
+    , position : Int
     }
 
 
@@ -109,7 +141,11 @@ type alias ProcessFields =
 
 
 type alias TaskState =
-    { applicability : Applicability, evidence : Maybe String }
+    { applicability : Applicability
+    , evidence : Maybe String
+    , applicabilityReview : Review
+    , completionReview : Review
+    }
 
 
 type alias Process =
@@ -141,6 +177,7 @@ type alias Board =
     , processes : Dict String Process
     , nextId : Int
     , revision : Int
+    , pendingOrderRevision : Int
     }
 
 
@@ -154,19 +191,25 @@ type alias Archive =
 
 type TaskChange
     = SetCompletion Completion
-    | ExcludeTask String
+    | ExcludeTask
     | RestoreTask
+    | Acknowledge Checkbox
 
 
 type Change
     = SaveOpportunity Target OpportunityFields
     | MoveOpportunity Ref Placement
     | ValidateOpportunity Ref
+    | ConfirmOpportunity Ref
     | RemoveOpportunity Ref
     | RestoreOpportunity Ref
-    | SavePending Target PendingFields
+    | SavePending Target PendingFields PendingMove
+    | MovePending Ref PendingShift
     | CompletePending Ref Completion
+    | ConfirmPending Ref
     | RemovePending Ref
+    | RestorePending Ref
+    | PurgePending Ref
     | CreateProcess ProcessFields
     | ChangeTask Ref String TaskChange
 
@@ -178,12 +221,40 @@ empty =
     , processes = Dict.empty
     , nextId = 1
     , revision = 0
+    , pendingOrderRevision = 0
     }
 
 
 emptyArchive : Archive
 emptyArchive =
     { checks = "[]", snapshots = "[]" }
+
+
+pendingTitle : PendingContent -> String
+pendingTitle content =
+    case content of
+        PendingTask title _ ->
+            title
+
+        Separator title ->
+            title
+
+
+pendingCompletion : PendingContent -> Maybe Completion
+pendingCompletion content =
+    case content of
+        PendingTask _ completion ->
+            Just completion
+
+        Separator _ ->
+            Nothing
+
+
+orderedPending : Owner -> Board -> List Pending
+orderedPending owner board =
+    Dict.values board.pending
+        |> List.filter (\item -> not item.deleted && item.fields.owner == owner)
+        |> List.sortBy (\item -> ( item.position, item.createdAt, item.id ))
 
 
 ref : { a | id : String, version : Int } -> Ref
@@ -273,7 +344,13 @@ processLabel value =
 
 taskState : String -> Process -> TaskState
 taskState id process =
-    Dict.get id process.states |> Maybe.withDefault { applicability = Applicable Todo, evidence = Nothing }
+    Dict.get id process.states
+        |> Maybe.withDefault
+            { applicability = Applicable Todo
+            , evidence = Nothing
+            , applicabilityReview = Reviewed
+            , completionReview = Reviewed
+            }
 
 
 progress : Process -> { done : Int, applicable : Int, excluded : Int }
@@ -288,7 +365,7 @@ progress process =
                     Applicable Todo ->
                         { total | applicable = total.applicable + 1 }
 
-                    NotApplicable _ _ ->
+                    NotApplicable _ ->
                         { total | excluded = total.excluded + 1 }
             )
             { done = 0, applicable = 0, excluded = 0 }

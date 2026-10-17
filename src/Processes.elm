@@ -1,25 +1,37 @@
-module Processes exposing (Model, Msg, init, settle, update, view)
+module Processes exposing (Model, Msg, init, isLocal, settle, subscriptions, update, view)
 
+import Browser.Events
 import Dict
-import Domain exposing (Applicability(..), Board, Change(..), Closure(..), Completion(..), Process, ProcessFields, ProcessKind(..), Ref, SaveState(..), Task, TaskChange(..))
+import Domain exposing (Applicability(..), Board, Change(..), Checkbox(..), Closure(..), Completion(..), Process, ProcessFields, ProcessKind(..), Ref, Review(..), SaveState(..), Task, TaskChange(..), User)
 import Html exposing (Html, button, caption, details, div, form, h2, h3, input, label, option, p, progress, section, select, span, strong, summary, table, tbody, td, text, textarea, th, thead, tr)
-import Html.Attributes as Attr exposing (attribute, checked, class, colspan, disabled, for, id, maxlength, placeholder, required, rows, scope, selected, type_, value)
-import Html.Events exposing (onCheck, onClick, onInput, onSubmit)
+import Html.Attributes as Attr exposing (attribute, checked, class, disabled, for, id, maxlength, placeholder, required, rows, scope, selected, type_, value)
+import Html.Events exposing (onBlur, onCheck, onClick, onFocus, onInput, onMouseEnter, onMouseLeave, onSubmit, preventDefaultOn)
 import Html.Keyed as Keyed
+import Json.Decode as Decode
+import Url
 
 
 type Model
-    = Model Editor String
+    = Model Editor String Tooltip
 
 
 
--- A single editor prevents an unrelated save from discarding another draft.
+-- Tooltip state is independent of saves, so an acknowledgement leaves it open.
 
 
 type Editor
     = Browsing
     | Creating Draft
-    | EditingReason Ref String String
+
+
+type Tooltip
+    = Hidden
+    | Hovered TipRef
+    | Focused TipRef
+
+
+type alias TipRef =
+    { process : String, task : String }
 
 
 type alias Draft =
@@ -43,89 +55,105 @@ type Msg
     | Edit Field String
     | Create
     | ChangeStatus Ref String TaskChange
-    | EditReason Ref String
-    | SetReason String
-    | SaveReason
-    | RetryReason
+    | HoverTip TipRef
+    | FocusTip TipRef
+    | LeaveTip TipRef
+    | BlurTip TipRef
+    | CloseTip
 
 
 init : Model
 init =
-    Model Browsing ""
+    Model Browsing "" Hidden
+
+
+subscriptions : Model -> Sub Msg
+subscriptions (Model _ _ tooltip) =
+    case tooltip of
+        Hidden ->
+            Sub.none
+
+        _ ->
+            Browser.Events.onKeyDown escapeKey
 
 
 update : Msg -> Board -> Model -> ( Model, Maybe Change )
-update msg board (Model editor error) =
+update msg _ (Model editor error tooltip) =
     case ( msg, editor ) of
         ( AddProcess, Browsing ) ->
-            ( Model (Creating { client = "", kind = Nothing, startDate = "", context = "" }) "", Nothing )
+            ( Model (Creating { client = "", kind = Nothing, startDate = "", context = "" }) "" tooltip, Nothing )
 
         ( Cancel, _ ) ->
-            ( init, Nothing )
+            ( Model Browsing "" tooltip, Nothing )
 
         ( Edit field inputValue, Creating draft ) ->
-            ( Model (Creating (editDraft field inputValue draft)) "", Nothing )
+            ( Model (Creating (editDraft field inputValue draft)) "" tooltip, Nothing )
 
         ( Create, Creating draft ) ->
             case processFields draft of
                 Ok fields ->
-                    ( Model editor "", Just (CreateProcess fields) )
+                    ( Model editor "" tooltip, Just (CreateProcess fields) )
 
                 Err message ->
-                    ( Model editor message, Nothing )
+                    ( Model editor message tooltip, Nothing )
 
         ( ChangeStatus processRef taskId change, Browsing ) ->
-            ( Model editor "", Just (ChangeTask processRef taskId change) )
+            ( Model editor "" tooltip, Just (ChangeTask processRef taskId change) )
 
-        ( EditReason processRef taskId, Browsing ) ->
-            case Dict.get processRef.id board.processes of
-                Just process ->
-                    let
-                        reason =
-                            case (Domain.taskState taskId process).applicability of
-                                NotApplicable _ note ->
-                                    note
+        ( HoverTip tip, _ ) ->
+            ( Model editor
+                error
+                (if tooltip == Focused tip then
+                    tooltip
 
-                                Applicable _ ->
-                                    ""
-                    in
-                    ( Model (EditingReason processRef taskId reason) "", Nothing )
+                 else
+                    Hovered tip
+                )
+            , Nothing
+            )
 
-                Nothing ->
-                    ( Model editor "El proceso ya no está disponible.", Nothing )
+        ( FocusTip tip, _ ) ->
+            ( Model editor error (Focused tip), Nothing )
 
-        ( SetReason note, EditingReason processRef taskId _ ) ->
-            ( Model (EditingReason processRef taskId note) "", Nothing )
+        ( LeaveTip tip, _ ) ->
+            ( Model editor
+                error
+                (if tooltip == Hovered tip then
+                    Hidden
 
-        ( SaveReason, EditingReason processRef taskId note ) ->
-            ( Model editor "", Just (ChangeTask processRef taskId (ExcludeTask (String.trim note))) )
+                 else
+                    tooltip
+                )
+            , Nothing
+            )
 
-        ( RetryReason, EditingReason processRef taskId note ) ->
-            case Dict.get processRef.id board.processes of
-                Just process ->
-                    let
-                        currentRef =
-                            Domain.ref process
-                    in
-                    ( Model (EditingReason currentRef taskId note) ""
-                    , Just (ChangeTask currentRef taskId (ExcludeTask (String.trim note)))
-                    )
+        ( BlurTip tip, _ ) ->
+            ( Model editor
+                error
+                (if tipVisible tip tooltip then
+                    Hidden
 
-                Nothing ->
-                    ( Model editor "El proceso ya no está disponible.", Nothing )
+                 else
+                    tooltip
+                )
+            , Nothing
+            )
+
+        ( CloseTip, _ ) ->
+            ( Model editor error Hidden, Nothing )
 
         _ ->
-            ( Model editor error, Nothing )
+            ( Model editor error tooltip, Nothing )
 
 
 settle : Result String () -> Model -> Model
-settle result (Model editor _) =
+settle result (Model editor _ tooltip) =
     case result of
         Ok () ->
-            init
+            Model Browsing "" tooltip
 
         Err error ->
-            Model editor error
+            Model editor error tooltip
 
 
 editDraft : Field -> String -> Draft -> Draft
@@ -177,8 +205,8 @@ processFields draft =
                     }
 
 
-view : SaveState -> Board -> Model -> Html Msg
-view saving board ((Model editor error) as model) =
+view : SaveState -> User -> Board -> Model -> Html Msg
+view saving user board ((Model editor error _) as model) =
     let
         processes =
             Dict.values board.processes
@@ -201,7 +229,7 @@ view saving board ((Model editor error) as model) =
             text ""
 
           else
-            p [ class "rounded-lg bg-red-50 p-3 text-sm text-red-800", attribute "role" "alert" ] [ text error ]
+            p [ class "rounded-lg bg-red-50 p-3 text-base text-red-800", attribute "role" "alert" ] [ text error ]
         , case editor of
             Creating draft ->
                 createForm saving draft
@@ -213,9 +241,9 @@ view saving board ((Model editor error) as model) =
                 [ text "Todavía no hay procesos. Agrega uno con su cliente, tipo y fecha de inicio." ]
 
           else
-            Keyed.node "div" [ class "space-y-4" ] (List.map (\process -> ( process.id, processView saving model process )) processes)
+            Keyed.node "div" [ class "grid grid-cols-1 items-start gap-4 lg:grid-cols-2" ] (List.map (\process -> ( process.id, processView saving user model process )) processes)
         , p [ class "text-sm text-slate-500" ]
-            [ text "Los cambios se comparten entre tus dispositivos. No aplica excluye el paso del avance y permite restaurar su estado anterior." ]
+            [ text "N/A excluye el paso del avance y conserva su estado. «!» indica un cambio de otro usuario: el primer clic lo reconoce y el siguiente cambia la casilla." ]
         ]
 
 
@@ -234,7 +262,7 @@ totalsView processes =
             , totalItem (String.fromInt (List.sum (List.map .done counts)) ++ "/" ++ String.fromInt (List.sum (List.map .applicable counts))) "pasos confirmados"
             , totalItem (String.fromInt closed) "cerrados por Rolando"
             ]
-        , p [ class "mt-3 text-xs text-slate-500" ]
+        , p [ class "mt-3 text-sm text-slate-500" ]
             [ text (String.fromInt (List.sum (List.map .excluded counts)) ++ " N/A fuera del avance. Un cierre personal no confirma los pasos.") ]
         ]
 
@@ -299,39 +327,46 @@ kindOption current kind code =
 formField : String -> String -> Html Msg -> Html Msg
 formField controlId title control =
     div [ class "space-y-1" ]
-        [ label [ for controlId, class "block text-sm font-medium text-slate-700" ] [ text title ]
+        [ label [ for controlId, class "block text-base font-medium text-slate-700" ] [ text title ]
         , control
         ]
 
 
-processView : SaveState -> Model -> Process -> Html Msg
-processView saving model process =
-    details [ class "rounded-xl border border-slate-200 bg-white shadow-sm" ]
-        [ summary [ class "cursor-pointer rounded-xl p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600" ]
+processView : SaveState -> User -> Model -> Process -> Html Msg
+processView saving user model process =
+    details [ class "min-w-0 rounded-xl border border-slate-200 bg-white shadow-sm" ]
+        [ summary [ class "cursor-pointer break-words rounded-xl p-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600" ]
             [ span [ class "font-semibold text-slate-900" ] [ text process.fields.client ]
             , span [ class "ml-3 text-sm text-slate-500" ] [ text (Domain.processLabel process.fields.kind) ]
             , span [ class "mt-2 block text-sm text-slate-600" ]
                 [ text ("Inicio: " ++ dateLabel process.fields.startDate ++ " · " ++ progressLabel process) ]
             , case process.closure of
                 PersonallyClosed _ ->
-                    span [ class "mt-2 inline-block rounded bg-amber-100 px-2 py-1 text-xs text-amber-900" ] [ text "Cerrado por Rolando" ]
+                    span [ class "mt-2 inline-block rounded bg-amber-100 px-2 py-1 text-sm text-amber-900" ] [ text "Cerrado por Rolando" ]
 
                 Open ->
                     text ""
             ]
-        , div [ class "space-y-4 border-t border-slate-100 p-4" ]
+        , div [ class "space-y-3 border-t border-slate-100 p-2 sm:p-3" ]
             [ optionalText process.fields.context
             , closureView process
             , progressView process
             , nextStep process
             , legacyView process.legacySummary
-            , div [ class "overflow-x-auto" ]
-                [ table [ class "w-full min-w-[620px] border-collapse text-sm" ]
+            , div []
+                [ table [ class "w-full table-fixed border-collapse text-base" ]
                     [ caption [ class "sr-only" ]
                         [ text (Domain.processLabel process.fields.kind ++ " de " ++ process.fields.client ++ ". Cada paso tiene un solo responsable.") ]
                     , thead []
-                        [ tr [] (List.map (\heading -> th [ scope "col", class "border-b border-slate-200 px-2 py-3 text-left font-medium text-slate-600" ] [ text heading ]) [ "Descripción", "dot", "Rolando", "Otros" ]) ]
-                    , tbody [] (List.concatMap (taskRows saving model process) (Domain.tasks process.fields.kind))
+                        [ tr []
+                            [ th [ scope "col", class "w-8 border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600" ] [ text "N/A" ]
+                            , th [ scope "col", class "border-b border-slate-200 px-1 py-2 text-left text-sm font-medium text-slate-600", Attr.style "overflow-wrap" "anywhere" ] [ text "Descripción" ]
+                            , ownerHeading "dot"
+                            , ownerHeading "Rolando"
+                            , ownerHeading "Otros"
+                            ]
+                        ]
+                    , tbody [] (List.map (taskRow saving user model process) (Domain.tasks process.fields.kind))
                     ]
                 ]
             ]
@@ -385,7 +420,7 @@ closureView process =
             text ""
 
         PersonallyClosed reason ->
-            div [ class "space-y-1 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" ]
+            div [ class "space-y-1 rounded-lg bg-amber-50 p-3 text-sm text-amber-900", Attr.style "overflow-wrap" "anywhere" ]
                 [ strong [] [ text "Cerrado por Rolando" ]
                 , p [] [ text reason ]
                 , p [] [ text "El cierre personal se conserva. Los pasos pendientes siguen por confirmar y el avance se calcula por separado." ]
@@ -415,7 +450,7 @@ nextStep process =
                         else
                             "Todos los pasos aplicables están confirmados."
         in
-        p [ class "rounded-lg bg-slate-50 p-3 text-sm text-slate-700" ] [ text description ]
+        p [ class "rounded-lg bg-slate-50 p-3 text-base text-slate-700" ] [ text description ]
 
 
 legacyView : String -> Html Msg
@@ -426,180 +461,80 @@ legacyView legacy =
     else
         details [ class "rounded-lg border border-slate-200 p-3 text-sm text-slate-600" ]
             [ summary [ class "cursor-pointer font-medium" ] [ text "Ver registro anterior conservado" ]
-            , p [ class "mt-2 whitespace-pre-wrap" ] [ text legacy ]
-            , p [ class "mt-2 text-xs" ] [ text "Este registro no confirma automáticamente los pasos de la plantilla." ]
+            , p [ class "mt-2 whitespace-pre-wrap", Attr.style "overflow-wrap" "anywhere" ] [ text legacy ]
+            , p [ class "mt-2 text-sm" ] [ text "Este registro no confirma automáticamente los pasos de la plantilla." ]
             ]
 
 
-taskRows : SaveState -> Model -> Process -> Task -> List (Html Msg)
-taskRows saving (Model editor error) process task =
+taskRow : SaveState -> User -> Model -> Process -> Task -> Html Msg
+taskRow saving user (Model editor _ tooltip) process task =
     let
         current =
             Domain.taskState task.id process
-
-        locked =
-            saving == Saving || editor /= Browsing
-
-        processRef =
-            Domain.ref process
-
-        excluded =
-            case current.applicability of
-                NotApplicable _ _ ->
-                    True
-
-                _ ->
-                    False
-
-        controls =
-            div [ class "mt-2 flex flex-wrap gap-2" ]
-                [ if task.allowNotApplicable then
-                    button
-                        [ type_ "button"
-                        , class secondaryButton
-                        , disabled locked
-                        , onClick
-                            (ChangeStatus processRef
-                                task.id
-                                (if excluded then
-                                    RestoreTask
-
-                                 else
-                                    ExcludeTask ""
-                                )
-                            )
-                        , attribute "aria-label"
-                            ((if excluded then
-                                "Restaurar estado anterior: "
-
-                              else
-                                "Marcar no aplica: "
-                             )
-                                ++ task.label
-                            )
-                        ]
-                        [ text
-                            (if excluded then
-                                "Restaurar estado anterior"
-
-                             else
-                                "No aplica"
-                            )
-                        ]
-
-                  else
-                    text ""
-                , if task.allowNotApplicable then
-                    button [ type_ "button", class secondaryButton, disabled locked, onClick (EditReason processRef task.id) ] [ text "Motivo de N/A" ]
-
-                  else
-                    text ""
-                ]
-
-        reasonEditor =
-            case editor of
-                EditingReason ref taskId reason ->
-                    if ref.id == process.id && taskId == task.id then
-                        [ tr [] [ td [ colspan 4, class "border-b border-slate-200 bg-indigo-50 p-3" ] [ reasonForm saving error process task reason ] ] ]
-
-                    else
-                        []
-
-                _ ->
-                    []
     in
-    tr
-        [ class
-            (if excluded then
-                "bg-slate-50 text-slate-500"
+    tr []
+        ([ td [ class "border-b border-slate-100 py-1 align-top" ]
+            [ fieldBox saving user editor process task ApplicabilityBox ]
+         , td [ class "border-b border-slate-100 px-1 py-1 align-top" ]
+            [ taskName tooltip process task
+            , if process.closure /= Open && current.applicability == Applicable Todo then
+                p [ class "text-sm text-amber-800", Attr.style "overflow-wrap" "anywhere" ] [ text "Por confirmar" ]
 
-             else
-                "text-slate-700"
-            )
-        ]
-        (td [ class "w-3/5 border-b border-slate-100 px-2 py-3 align-top" ]
-            [ details []
-                [ summary [ class "cursor-pointer font-medium" ] [ text task.label ]
-                , p [ class "mt-2" ] [ text task.detail ]
-                , optionalText task.condition
-                ]
+              else
+                text ""
             , case current.evidence of
                 Just evidence ->
-                    p [ class "mt-2 whitespace-pre-wrap text-xs text-emerald-800" ] [ strong [] [ text "Evidencia: " ], text evidence ]
+                    p [ class "mt-1 whitespace-pre-wrap break-words text-sm text-emerald-800", Attr.style "overflow-wrap" "anywhere" ]
+                        [ strong [] [ text "Evidencia: " ], text evidence ]
 
                 Nothing ->
                     text ""
-            , case current.applicability of
-                NotApplicable _ reason ->
-                    optionalText reason
+            ]
+         ]
+            ++ List.map (ownerCell saving user editor process task) [ "dot", "Rolando", "Otros" ]
+        )
+
+
+ownerHeading : String -> Html Msg
+ownerHeading owner =
+    th
+        [ scope "col"
+        , class
+            ((case owner of
+                "Rolando" ->
+                    "w-14"
+
+                "dot" ->
+                    "w-8"
 
                 _ ->
-                    text ""
-            , controls
-            ]
-            :: List.map (ownerCell saving editor process task) [ "dot", "Rolando", "Otros" ]
-        )
-        :: reasonEditor
+                    "w-10"
+             )
+                ++ " border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600"
+            )
+        ]
+        [ text owner ]
 
 
-ownerCell : SaveState -> Editor -> Process -> Task -> String -> Html Msg
-ownerCell saving editor process task column =
+ownerCell : SaveState -> User -> Editor -> Process -> Task -> String -> Html Msg
+ownerCell saving user editor process task column =
     let
-        current =
-            (Domain.taskState task.id process).applicability
-
         group =
             if task.owner == "dot" || task.owner == "Rolando" then
                 task.owner
 
             else
                 "Otros"
-
-        excluded =
-            case current of
-                NotApplicable _ _ ->
-                    True
-
-                _ ->
-                    False
     in
-    td [ class "border-b border-slate-100 px-2 py-3 align-top" ]
+    td [ class "border-b border-slate-100 py-1 text-center align-top" ]
         [ if column /= group then
             text ""
 
           else
-            div [ class "space-y-1" ]
-                [ input
-                    [ type_ "checkbox"
-                    , class "h-5 w-5 accent-indigo-600"
-                    , checked (current == Applicable Done)
-                    , disabled (saving == Saving || editor /= Browsing || excluded)
-                    , attribute "aria-label" (process.fields.client ++ ": " ++ task.label ++ " · " ++ task.owner)
-                    , onCheck
-                        (\done ->
-                            ChangeStatus (Domain.ref process)
-                                task.id
-                                (SetCompletion
-                                    (if done then
-                                        Done
-
-                                     else
-                                        Todo
-                                    )
-                                )
-                        )
-                    ]
-                    []
+            div []
+                [ fieldBox saving user editor process task CompletionBox
                 , if column == "Otros" then
-                    p [ class "text-xs" ] [ text task.owner ]
-
-                  else
-                    text ""
-                , if excluded then
-                    p [ class "text-xs text-slate-500" ] [ text "N/A" ]
-
-                  else if process.closure /= Open && current == Applicable Todo then
-                    p [ class "text-xs text-amber-800" ] [ text "Por confirmar" ]
+                    p [ class "break-words text-sm leading-tight", Attr.style "overflow-wrap" "anywhere" ] [ text task.owner ]
 
                   else
                     text ""
@@ -607,28 +542,231 @@ ownerCell saving editor process task column =
         ]
 
 
-reasonForm : SaveState -> String -> Process -> Task -> String -> Html Msg
-reasonForm saving error process task reason =
-    let
-        controlId =
-            "reason-" ++ process.id ++ "-" ++ task.id
-    in
-    form [ class "space-y-3", onSubmit SaveReason ]
-        [ formField controlId
-            ("Motivo de N/A para «" ++ task.label ++ "» (opcional)")
-            (textarea [ id controlId, class fieldClass, rows 2, maxlength 600, value reason, disabled (saving == Saving), onInput SetReason ] [])
-        , optionalText task.condition
-        , p [ class "text-xs text-slate-600" ] [ text "No aplica excluye el paso del avance. Su estado anterior se conserva." ]
-        , div [ class "flex flex-wrap gap-2" ]
-            [ button [ type_ "submit", class primaryButton, disabled (saving == Saving) ] [ text "Guardar N/A" ]
-            , if String.isEmpty error then
-                text ""
+type alias Control =
+    { checked : Bool
+    , blocked : Bool
+    , review : Review
+    , toggle : TaskChange
+    , label : String
+    }
 
-              else
-                button [ type_ "button", class secondaryButton, disabled (saving == Saving), onClick RetryReason ] [ text "Aplicar sobre versión actual" ]
-            , button [ type_ "button", class secondaryButton, disabled (saving == Saving), onClick Cancel ] [ text "Cancelar" ]
+
+fieldBox : SaveState -> User -> Editor -> Process -> Task -> Checkbox -> Html Msg
+fieldBox saving user editor process task box =
+    let
+        control =
+            boxControl process task box
+
+        reviewNeeded =
+            control.review == NeedsReview user
+
+        action =
+            ChangeStatus (Domain.ref process) task.id
+
+        interaction =
+            if reviewNeeded then
+                -- Prevent the browser's checkbox toggle on the acknowledgement click.
+                preventDefaultOn "click" (Decode.succeed ( action (Acknowledge box), True ))
+
+            else
+                onCheck (\_ -> action control.toggle)
+
+        description =
+            control.label
+                ++ process.fields.client
+                ++ ": "
+                ++ task.label
+                ++ (if reviewNeeded then
+                        ". Cambio de otro usuario pendiente de revisar. Pulsa para reconocer sin cambiar la casilla."
+
+                    else
+                        ""
+                   )
+    in
+    label [ class "inline-flex min-h-8 w-full items-center justify-center gap-0.5" ]
+        [ input
+            [ type_ "checkbox"
+            , class "h-4 w-4 shrink-0 accent-indigo-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            , checked control.checked
+            , disabled (saving == Saving || editor /= Browsing || (control.blocked && not reviewNeeded))
+            , attribute "aria-label" description
+            , interaction
             ]
+            []
+        , if reviewNeeded then
+            span [ class "text-sm font-bold leading-none text-amber-700", attribute "aria-hidden" "true" ] [ text "!" ]
+
+          else
+            text ""
         ]
+
+
+boxControl : Process -> Task -> Checkbox -> Control
+boxControl process task box =
+    let
+        current =
+            Domain.taskState task.id process
+
+        completion =
+            case current.applicability of
+                Applicable state ->
+                    state
+
+                NotApplicable state ->
+                    state
+
+        excluded =
+            isExcluded current.applicability
+    in
+    case box of
+        ApplicabilityBox ->
+            { checked = excluded
+            , blocked = not task.allowNotApplicable
+            , review = current.applicabilityReview
+            , toggle =
+                if excluded then
+                    RestoreTask
+
+                else
+                    ExcludeTask
+            , label = "No aplica. "
+            }
+
+        CompletionBox ->
+            { checked = completion == Done
+            , blocked = excluded
+            , review = current.completionReview
+            , toggle =
+                SetCompletion
+                    (if completion == Done then
+                        Todo
+
+                     else
+                        Done
+                    )
+            , label = "Confirmado por " ++ task.owner ++ ". "
+            }
+
+
+isExcluded : Applicability -> Bool
+isExcluded applicability =
+    case applicability of
+        Applicable _ ->
+            False
+
+        NotApplicable _ ->
+            True
+
+
+taskName : Tooltip -> Process -> Task -> Html Msg
+taskName tooltip process task =
+    let
+        tip =
+            { process = process.id, task = task.id }
+
+        visible =
+            tipVisible tip tooltip
+
+        descriptionId =
+            "process-tip-" ++ Url.percentEncode process.id ++ ":" ++ Url.percentEncode task.id
+
+        nameStyle =
+            if isExcluded (Domain.taskState task.id process).applicability then
+                "text-slate-400 line-through"
+
+            else
+                "text-slate-700"
+    in
+    div
+        [ class "relative"
+        , onMouseEnter (HoverTip tip)
+        , onMouseLeave (LeaveTip tip)
+        ]
+        [ button
+            ([ type_ "button"
+             , class ("w-full rounded py-1 text-left text-base font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600 " ++ nameStyle)
+             , Attr.style "overflow-wrap" "anywhere"
+             , onFocus (FocusTip tip)
+             , onBlur (BlurTip tip)
+             , onClick (FocusTip tip)
+             ]
+                ++ (if visible then
+                        [ attribute "aria-describedby" descriptionId ]
+
+                    else
+                        []
+                   )
+            )
+            [ text task.label ]
+        , if visible then
+            -- Owner columns total 8rem (2 + 3.5 + 2.5); keep the tooltip inside the card.
+            div [ class "absolute left-0 top-full z-30 pt-1", Attr.style "width" "calc(100% + 8rem)" ]
+                [ div
+                    [ id descriptionId
+                    , attribute "role" "tooltip"
+                    , class "space-y-2 rounded-lg bg-slate-900 p-3 text-left text-[0.7rem] font-normal leading-normal text-white shadow-lg"
+                    , Attr.style "overflow-wrap" "anywhere"
+                    ]
+                    [ p [] [ text task.detail ]
+                    , if String.isEmpty task.condition then
+                        text ""
+
+                      else
+                        p [ class "text-slate-200" ] [ text task.condition ]
+                    ]
+                ]
+
+          else
+            text ""
+        ]
+
+
+tipVisible : TipRef -> Tooltip -> Bool
+tipVisible tip tooltip =
+    case tooltip of
+        Hidden ->
+            False
+
+        Hovered current ->
+            current == tip
+
+        Focused current ->
+            current == tip
+
+
+escapeKey : Decode.Decoder Msg
+escapeKey =
+    Decode.field "key" Decode.string
+        |> Decode.andThen
+            (\key ->
+                if key == "Escape" then
+                    Decode.succeed CloseTip
+
+                else
+                    Decode.fail "Other key"
+            )
+
+
+isLocal : Msg -> Bool
+isLocal msg =
+    case msg of
+        HoverTip _ ->
+            True
+
+        FocusTip _ ->
+            True
+
+        LeaveTip _ ->
+            True
+
+        BlurTip _ ->
+            True
+
+        CloseTip ->
+            True
+
+        _ ->
+            False
 
 
 optionalText : String -> Html Msg
@@ -637,7 +775,7 @@ optionalText content =
         text ""
 
     else
-        p [ class "mt-2 whitespace-pre-wrap text-sm text-slate-600" ] [ text content ]
+        p [ class "mt-2 whitespace-pre-wrap text-sm text-slate-600", Attr.style "overflow-wrap" "anywhere" ] [ text content ]
 
 
 dateLabel : String -> String
@@ -652,14 +790,14 @@ dateLabel raw =
 
 fieldClass : String
 fieldClass =
-    "block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
+    "block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
 
 
 primaryButton : String
 primaryButton =
-    "rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+    "rounded-lg bg-indigo-600 px-3 py-2 text-base font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
 
 
 secondaryButton : String
 secondaryButton =
-    "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+    "rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"

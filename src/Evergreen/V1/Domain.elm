@@ -3,6 +3,11 @@ module Evergreen.V1.Domain exposing (..)
 import Dict
 
 
+type User
+    = UserOne
+    | UserTwo
+
+
 type Category
     = Ventex
     | Contractor
@@ -34,6 +39,11 @@ type alias OpportunityFields =
     }
 
 
+type Review
+    = Reviewed
+    | NeedsReview User
+
+
 type alias Opportunity =
     { id : String
     , fields : OpportunityFields
@@ -43,7 +53,18 @@ type alias Opportunity =
     , version : Int
     , createdAt : String
     , updatedAt : String
+    , review : Review
     }
+
+
+type Completion
+    = Todo
+    | Done
+
+
+type PendingContent
+    = PendingTask String Completion
+    | Separator String
 
 
 type Owner
@@ -52,15 +73,9 @@ type Owner
     | Others
 
 
-type Completion
-    = Todo
-    | Done
-
-
 type alias PendingFields =
-    { title : String
+    { content : PendingContent
     , owner : Owner
-    , completion : Completion
     }
 
 
@@ -71,6 +86,8 @@ type alias Pending =
     , version : Int
     , createdAt : String
     , updatedAt : String
+    , review : Review
+    , position : Int
     }
 
 
@@ -89,12 +106,14 @@ type alias ProcessFields =
 
 type Applicability
     = Applicable Completion
-    | NotApplicable Completion String
+    | NotApplicable Completion
 
 
 type alias TaskState =
     { applicability : Applicability
     , evidence : Maybe String
+    , applicabilityReview : Review
+    , completionReview : Review
     }
 
 
@@ -122,6 +141,7 @@ type alias Board =
     , processes : Dict.Dict String Process
     , nextId : Int
     , revision : Int
+    , pendingOrderRevision : Int
     }
 
 
@@ -144,31 +164,48 @@ type alias Placement =
     }
 
 
-type SaveState
-    = Ready
-    | Saving
-
-
 type alias Archive =
     { checks : String
     , snapshots : String
     }
 
 
+type Checkbox
+    = ApplicabilityBox
+    | CompletionBox
+
+
 type TaskChange
     = SetCompletion Completion
-    | ExcludeTask String
+    | ExcludeTask
     | RestoreTask
+    | Acknowledge Checkbox
+
+
+type alias PendingShift =
+    { revision : Int
+    , steps : Int
+    }
+
+
+type PendingMove
+    = KeepPosition
+    | ShiftPosition PendingShift
 
 
 type Change
     = SaveOpportunity Target OpportunityFields
     | MoveOpportunity Ref Placement
     | ValidateOpportunity Ref
+    | ConfirmOpportunity Ref
     | RemoveOpportunity Ref
     | RestoreOpportunity Ref
-    | SavePending Target PendingFields
+    | SavePending Target PendingFields PendingMove
+    | MovePending Ref PendingShift
     | CompletePending Ref Completion
+    | ConfirmPending Ref
     | RemovePending Ref
+    | RestorePending Ref
+    | PurgePending Ref
     | CreateProcess ProcessFields
     | ChangeTask Ref String TaskChange

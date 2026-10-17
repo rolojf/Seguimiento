@@ -4,7 +4,7 @@ import Browser
 import Browser.Navigation as Nav
 import Dashboard
 import Dict
-import Domain exposing (SaveState(..))
+import Domain exposing (SaveState(..), User(..))
 import File
 import File.Download
 import File.Select
@@ -13,7 +13,7 @@ import Html.Attributes as Attr
 import Html.Events as Events
 import Lamdera
 import Task
-import Types exposing (ActiveSession, FrontendModel, FrontendMsg(..), LoginForm, LoginState(..), PrivateData, ToBackend(..), ToFrontend(..), User(..), Work(..))
+import Types exposing (ActiveSession, FrontendModel, FrontendMsg(..), LoginForm, LoginState(..), PrivateData, Theme(..), ToBackend(..), ToFrontend(..), Work(..))
 import Url exposing (Url)
 
 
@@ -24,14 +24,24 @@ app =
         , onUrlChange = UrlChanged
         , update = update
         , updateFromBackend = updateFromBackend
-        , subscriptions = \_ -> Sub.none
+        , subscriptions = subscriptions
         , view = view
         }
 
 
+subscriptions : FrontendModel -> Sub FrontendMsg
+subscriptions model =
+    case model.login of
+        SignedIn active ->
+            Sub.map BoardMsg (Dashboard.subscriptions active.dashboard)
+
+        _ ->
+            Sub.none
+
+
 init : Url -> Nav.Key -> ( FrontendModel, Cmd FrontendMsg )
 init _ key =
-    ( { key = key, login = CheckingSession, nextRequest = 1 }, Cmd.none )
+    ( { key = key, login = CheckingSession, nextRequest = 1, theme = SystemTheme }, Cmd.none )
 
 
 emptyForm : LoginForm
@@ -42,6 +52,9 @@ emptyForm =
 update : FrontendMsg -> FrontendModel -> ( FrontendModel, Cmd FrontendMsg )
 update msg model =
     case msg of
+        ThemeChanged theme ->
+            ( { model | theme = theme }, Cmd.none )
+
         UrlRequested (Browser.Internal url) ->
             ( model, Nav.pushUrl model.key (Url.toString url) )
 
@@ -92,7 +105,7 @@ updateBoard : FrontendMsg -> ActiveSession -> FrontendModel -> ( FrontendModel, 
 updateBoard msg active model =
     case msg of
         BoardMsg action ->
-            if active.work /= Nothing then
+            if active.work /= Nothing && not (Dashboard.isLocal action) then
                 ( model, Cmd.none )
 
             else
@@ -273,23 +286,70 @@ view : FrontendModel -> Browser.Document FrontendMsg
 view model =
     { title = "Seguimiento · Lamdera"
     , body =
-        [ case model.login of
-            CheckingSession ->
-                viewStatus "Comprobando sesión…"
+        [ Html.div [ Attr.class "app-shell min-h-screen", Attr.attribute "data-theme" (themeValue model.theme) ]
+            [ themeControl model.theme
+            , case model.login of
+                CheckingSession ->
+                    viewStatus "Comprobando sesión…"
 
-            SignedOut form ->
-                viewSignIn form
+                SignedOut form ->
+                    viewSignIn form
 
-            SigningIn _ ->
-                viewStatus "Iniciando sesión…"
+                SigningIn _ ->
+                    viewStatus "Iniciando sesión…"
 
-            SignedIn active ->
-                viewDashboard active
+                SignedIn active ->
+                    viewDashboard active
 
-            SigningOut ->
-                viewStatus "Cerrando sesión…"
+                SigningOut ->
+                    viewStatus "Cerrando sesión…"
+            ]
         ]
     }
+
+
+themeControl : Theme -> Html FrontendMsg
+themeControl theme =
+    Html.div [ Attr.class "mx-auto flex max-w-7xl justify-end px-4 py-3 sm:px-6" ]
+        [ Html.label [ Attr.class "flex items-center gap-2 text-sm text-slate-700" ]
+            [ Html.text "Apariencia"
+            , Html.select
+                [ Attr.class "rounded border border-slate-300 bg-white px-3 py-2 text-slate-900"
+                , Attr.value (themeValue theme)
+                , Events.onInput
+                    (\selected ->
+                        ThemeChanged
+                            (case selected of
+                                "light" ->
+                                    LightTheme
+
+                                "dark" ->
+                                    DarkTheme
+
+                                _ ->
+                                    SystemTheme
+                            )
+                    )
+                ]
+                [ Html.option [ Attr.value "system" ] [ Html.text "Sistema" ]
+                , Html.option [ Attr.value "light" ] [ Html.text "Claro" ]
+                , Html.option [ Attr.value "dark" ] [ Html.text "Oscuro" ]
+                ]
+            ]
+        ]
+
+
+themeValue : Theme -> String
+themeValue theme =
+    case theme of
+        SystemTheme ->
+            "system"
+
+        LightTheme ->
+            "light"
+
+        DarkTheme ->
+            "dark"
 
 
 viewStatus : String -> Html msg
@@ -309,7 +369,7 @@ viewSignIn form =
                 , Attr.class "space-y-6 rounded-lg bg-white px-6 py-8 shadow sm:px-10"
                 ]
                 [ Html.div []
-                    [ Html.label [ Attr.for "username", Attr.class "block text-sm font-medium text-gray-900" ]
+                    [ Html.label [ Attr.for "username", Attr.class "block text-base font-medium text-gray-900" ]
                         [ Html.text "Usuario" ]
                     , Html.input
                         [ Attr.id "username"
@@ -327,7 +387,7 @@ viewSignIn form =
                         []
                     ]
                 , Html.div []
-                    [ Html.label [ Attr.for "password", Attr.class "block text-sm font-medium text-gray-900" ]
+                    [ Html.label [ Attr.for "password", Attr.class "block text-base font-medium text-gray-900" ]
                         [ Html.text "Clave de acceso" ]
                     , Html.input
                         [ Attr.id "password"
@@ -344,7 +404,7 @@ viewSignIn form =
                     ]
                 , case form.error of
                     Just error ->
-                        Html.p [ Attr.attribute "role" "alert", Attr.class "text-sm text-red-700" ]
+                        Html.p [ Attr.attribute "role" "alert", Attr.class "text-base text-red-700" ]
                             [ Html.text error ]
 
                     Nothing ->
@@ -383,15 +443,15 @@ viewDashboard active =
                 [ Html.div [ Attr.class "flex flex-wrap items-center justify-between gap-4" ]
                     [ Html.div []
                         [ Html.h1 [ Attr.class "text-2xl font-bold tracking-tight" ] [ Html.text "Seguimiento" ]
-                        , Html.p [ Attr.class "mt-1 text-sm text-slate-500" ] [ Html.text "Oportunidades, procesos y pendientes" ]
+                        , Html.p [ Attr.class "mt-1 text-base text-slate-500" ] [ Html.text "Oportunidades, procesos y pendientes" ]
                         ]
-                    , Html.div [ Attr.class "flex flex-wrap items-center gap-3 text-sm" ]
+                    , Html.div [ Attr.class "flex flex-wrap items-center gap-3 text-base" ]
                         [ Html.span [ Attr.class "text-slate-600" ] [ Html.text (userLabel active.data.user) ]
                         , Html.button [ Attr.type_ "button", Events.onClick SignOut, Attr.class "rounded border border-slate-300 px-3 py-2 hover:bg-slate-50" ] [ Html.text "Cerrar sesión" ]
                         ]
                     ]
                 , Html.div [ Attr.class "mt-5 flex flex-wrap items-center justify-between gap-3" ]
-                    [ Html.nav [ Attr.attribute "aria-label" "Secciones del tablero", Attr.class "flex flex-wrap gap-4 text-sm font-medium text-blue-700" ]
+                    [ Html.nav [ Attr.attribute "aria-label" "Secciones del tablero", Attr.class "flex flex-wrap gap-4 text-base font-medium text-blue-700" ]
                         [ Html.a [ Attr.href "#oportunidades" ] [ Html.text "Oportunidades" ]
                         , Html.a [ Attr.href "#procesos" ] [ Html.text "Procesos" ]
                         , Html.a [ Attr.href "#pendientes" ] [ Html.text "Pendientes" ]
@@ -416,13 +476,13 @@ viewDashboard active =
 
           else
             Html.text ""
-        , Html.map BoardMsg (Dashboard.view state active.data.board active.dashboard)
+        , Html.map BoardMsg (Dashboard.view state active.data.user active.data.board active.dashboard)
         ]
 
 
 toolbarClass : String
 toolbarClass =
-    "rounded border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+    "rounded border border-slate-300 px-3 py-2 text-base hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
 
 
 userLabel : User -> String

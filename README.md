@@ -19,13 +19,55 @@ El contador de la plantilla se sustituyó por el tablero:
 - Procesos Nueva OTI y Entregas con sus 17 y 23 tareas, responsables, avance,
   confirmación, pendiente y N/A reversible. Evidencia, cierre personal e historial
   se conservan sin confundir cierre con tareas completadas.
-- Pendientes agrupados por Rolando, dot y Otros, con alta, edición y cumplimiento.
-- Importación y descarga del respaldo completo compatible con el formato anterior.
+- Pendientes agrupados por Rolando, dot y Otros, con edición, cumplimiento, orden
+  manual y separadores en blanco o con texto.
+- Importación de respaldos anteriores y descarga del formato Lamdera que conserva
+  los separadores y el orden manual.
 
 Los dos usuarios comparten el mismo tablero. Las versiones de cada registro
 impiden que una edición antigua sobrescriba un cambio ajeno; las vistas conservan
 los formularios abiertos cuando llegan actualizaciones. No se necesita sondeo
 HTTP periódico ni una base SQL adicional.
+
+Los procesos se distribuyen en dos columnas en pantalla ancha y una en móvil.
+La explicación de cada tarea aparece al pasar el puntero, enfocar o tocar su
+nombre. N/A tiene su propia columna; las tareas excluidas aparecen grises y
+tachadas. Se retiraron los comentarios de N/A, incluidos los anteriores.
+
+Cada casilla de proceso conserva por separado quién debe revisar el último
+cambio. Si `usuario1` la cambia, `usuario2` ve «!»: su primer clic confirma
+la revisión sin cambiar el valor; el siguiente clic modifica el valor y avisa
+a `usuario1`. Reconocer un cambio no produce otro aviso. Estos datos se guardan
+en Lamdera, también al cerrar sesión. Las columnas dot, Rolando y Otros indican
+responsables de tareas; son independientes de las dos cuentas de acceso.
+
+Las oportunidades y los pendientes nuevos también muestran «!» al otro usuario.
+Confirmar una oportunidad la valida; confirmar un pendiente mantiene su estado
+de cumplimiento. Descartar oculta el registro de la vista activa y resuelve su
+aviso, pero conserva los datos. El filtro «Descartados» permite consultarlos con
+su fecha de descarte, del más reciente al más antiguo. Los registros anteriores
+comienzan sin avisos retroactivos.
+
+En oportunidades, seleccionar el elemento y pulsar «Descartar» lo retira sin
+otro diálogo. Desde «Descartados», «Volver a vigentes» lo restaura al mapa;
+también se conserva el aviso inmediato «Deshacer».
+
+En pendientes, «Editar» abre un formulario con «Descartar» o «Restaurar» según su
+estado. «Borrar definitivamente» aparece únicamente para pendientes descartados;
+el backend también exige ese estado. Para modificar un descartado hay que
+restaurarlo primero. El orden se cambia arrastrando desde el asa o indicando
+cuántas posiciones subir (positivo) o bajar (negativo) al editar, conservando
+el responsable. Los separadores ocupan una posición y no cuentan como tareas.
+Una actualización ajena del orden obliga a revisar el movimiento antes de
+guardarlo, para evitar aplicar posiciones antiguas.
+
+La tipografía principal parte de 18 px y la secundaria de 16 px con la
+configuración habitual del navegador; ambas respetan su tamaño de letra y zoom.
+Los tooltips conservan su letra pequeña. Oportunidades, procesos y pendientes
+usan respectivamente tonos verdes, índigo y ámbar. «Apariencia» permite elegir
+Sistema, Claro u Oscuro; Sistema sigue la preferencia del dispositivo. La elección
+manual se conserva mientras la página permanece abierta. En modo oscuro, las
+tres secciones tienen también textos con su propio matiz de color.
 
 Acadia y SQLite no forman parte del proyecto; la aplicación JavaScript anterior
 se conserva en `../Seguimiento/`.
@@ -119,8 +161,9 @@ seleccionar `../Seguimiento/seguimiento-data-20261014T202903613Z.json` u otro
 respaldo compatible. El archivo local disponible es una instantánea del 14 de
 octubre de 2026, no una lectura del sitio actual.
 
-El backend acepta únicamente el formato `seguimiento-d1-backup`, versión 1,
-hasta 5 MB. Comprueba todas las tablas y filas antes de modificar el estado.
+El backend acepta `seguimiento-d1-backup`, versión 1, y
+`seguimiento-lamdera-backup`, versión 2, hasta 5 MB. Comprueba todas las tablas
+y filas antes de modificar el estado.
 Solo permite importar sobre un tablero vacío y sin historial previo; no reemplaza
 datos existentes. Se conservan identificadores, versiones, fechas, posiciones,
 filas eliminadas, evidencia, cierre personal y resumen anterior de los procesos.
@@ -128,7 +171,12 @@ Las tablas antiguas `checks` y `process_snapshots` se guardan como archivo hist�
 en el backend, no se convierten en tareas activas duplicadas.
 
 «Descargar respaldo» exporta las cinco tablas, incluido ese archivo histórico,
-con el mismo formato. No incluye claves ni sesiones. No se importaron los datos
+en el formato Lamdera versión 2. Este conserva el tipo y posición de cada
+pendiente y el siguiente identificador, incluso después de borrar filas. No es
+un archivo para restaurar directamente en la aplicación JavaScript anterior.
+No incluye claves, sesiones ni avisos de revisión; al importar, los registros
+se consideran ya revisados. Los motivos N/A antiguos se
+descartan al importar y no se exportan. No se importaron los datos
 del respaldo anterior; se conserva únicamente como referencia y recuperación
 opcional si el usuario decide utilizarlo más adelante.
 
@@ -140,7 +188,7 @@ alojada requiere asociar y desplegar una aplicación Lamdera.
 
 - `src/Domain.elm`: datos tipados, mensajes del tablero y plantillas de tareas.
 - `src/BoardStore.elm`: validación y cambios de estado con control de versiones.
-- `src/Backup.elm`: lectura y escritura del formato de respaldo anterior.
+- `src/Backup.elm`: importación de respaldos D1 v1 y Lamdera v2; exportación v2.
 - `src/Opportunities.elm`, `src/Processes.elm`, `src/Pending.elm`: vistas y
   formularios de cada sección, con Tailwind.
 - `src/Dashboard.elm`: reúne esas tres secciones y sus avisos de guardado.
@@ -166,10 +214,11 @@ Por indicación del usuario, no se añadieron tests ni se ejecutaron pruebas del
 tablero. La revisión de reglas, autorización e importación fue estática; el uso
 real en el navegador y la importación de datos siguen sin comprobarse.
 
-`lamdera check` compila y después informa `UNKNOWN APP`: falta asociar una
-aplicación mediante el remoto `lamdera`. Por tanto, la comprobación completa de
-despliegue y Evergreen sigue pendiente. El remoto GitHub no crea una aplicación
-en Lamdera por sí solo.
+El remoto `lamdera` está asociado a `seguimiento`. La consulta pública de versión
+indica `v = 0`: todavía no hay un primer despliegue. `lamdera check` compila y
+regenera el snapshot `src/Evergreen/V1/`; no corresponde crear una migración V2.
+Después se detiene al comprobar configuración porque falta autenticación de CLI
+(`lamdera login`). La comprobación completa y el despliegue siguen pendientes.
 
 Se usó el compilador nativo ya instalado y una caché dentro de
 `node_modules/.cache/elm`, mediante `ELM_HOME`, sin instalar herramientas globales.

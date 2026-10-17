@@ -2,7 +2,7 @@ module Opportunities exposing (Model, Msg, init, settle, update, view)
 
 import Browser.Dom as Dom
 import Dict
-import Domain exposing (Board, Category(..), Change(..), Kind(..), Opportunity, OpportunityFields, Placement, Rating(..), Ref, SaveState(..), Target(..))
+import Domain exposing (Board, Category(..), Change(..), Kind(..), Opportunity, OpportunityFields, Placement, Rating(..), Ref, Review(..), SaveState(..), Target(..), User)
 import Html exposing (Html)
 import Html.Attributes as Attr
 import Html.Events as Events
@@ -14,6 +14,7 @@ import Url
 type alias Model =
     { category : Maybe Category
     , kind : Maybe Kind
+    , status : ViewStatus
     , panel : Panel
     , request : Request
     , undo : Maybe String
@@ -24,11 +25,15 @@ type alias Model =
     }
 
 
+type ViewStatus
+    = ActiveOnly
+    | DiscardedOnly
+
+
 type Panel
     = Closed
     | Detail String
     | Editor Target OpportunityFields
-    | ConfirmRemoval Ref
 
 
 type Request
@@ -95,6 +100,7 @@ type Validation
 type Msg
     = FilterCategory (Maybe Category)
     | FilterKind (Maybe Kind)
+    | FilterStatus ViewStatus
     | Select String
     | Add
     | Edit String
@@ -106,10 +112,10 @@ type Msg
     | SetRating Axis Rating
     | SetValidation Validation
     | Save
-    | Validate String
-    | AskRemove String
-    | Remove
-    | Undo
+    | Validate Ref
+    | Confirm Ref
+    | Discard Ref
+    | Restore Ref
     | DismissUndo
     | StartDrag String Int Point
     | GotBounds Int (Result Dom.Error Dom.Element)
@@ -123,6 +129,7 @@ init : Model
 init =
     { category = Nothing
     , kind = Nothing
+    , status = ActiveOnly
     , panel = Closed
     , request = Idle
     , undo = Nothing
@@ -186,6 +193,9 @@ updateReady msg board model =
         FilterKind kind ->
             unchanged { model | kind = kind, drag = Still }
 
+        FilterStatus status ->
+            unchanged { model | status = status, panel = Closed, drag = Still, error = Nothing, skipClick = Nothing }
+
         Select id ->
             if model.skipClick == Just id then
                 unchanged { model | skipClick = Nothing }
@@ -220,12 +230,7 @@ updateReady msg board model =
         Escape ->
             case model.drag of
                 Still ->
-                    case model.panel of
-                        ConfirmRemoval ref ->
-                            unchanged { model | panel = Detail ref.id }
-
-                        _ ->
-                            unchanged { model | panel = Closed, error = Nothing }
+                    unchanged { model | panel = Closed, error = Nothing }
 
                 _ ->
                     unchanged (cancelDrag model)
@@ -259,7 +264,8 @@ updateReady msg board model =
                         unchanged { model | error = Just "La fuente debe ser un enlace http:// o https://." }
 
                     else
-                        submit (SaveForm target) (SaveOpportunity target clean)
+                        submit (SaveForm target)
+                            (SaveOpportunity target clean)
                             { model
                                 | category = keepFilter clean.category model.category
                                 , kind = keepFilter clean.kind model.kind
@@ -268,41 +274,17 @@ updateReady msg board model =
                 _ ->
                     unchanged model
 
-        Validate id ->
-            case active id board of
-                Just item ->
-                    submit ChangeItem (ValidateOpportunity (Domain.ref item)) model
+        Validate ref ->
+            submit ChangeItem (ValidateOpportunity ref) model
 
-                Nothing ->
-                    unchanged model
+        Confirm ref ->
+            submit ChangeItem (ConfirmOpportunity ref) model
 
-        AskRemove id ->
-            case active id board of
-                Just item ->
-                    unchanged { model | panel = ConfirmRemoval (Domain.ref item), error = Nothing }
+        Discard ref ->
+            submit (DeleteItem ref.id) (RemoveOpportunity ref) model
 
-                Nothing ->
-                    unchanged model
-
-        Remove ->
-            case model.panel of
-                ConfirmRemoval ref ->
-                    submit (DeleteItem ref.id) (RemoveOpportunity ref) model
-
-                _ ->
-                    unchanged model
-
-        Undo ->
-            case model.undo |> Maybe.andThen (\id -> Dict.get id board.opportunities) of
-                Just item ->
-                    if item.deleted then
-                        submit (RestoreItem item.id) (RestoreOpportunity (Domain.ref item)) model
-
-                    else
-                        unchanged { model | undo = Nothing }
-
-                Nothing ->
-                    unchanged model
+        Restore ref ->
+            submit (RestoreItem ref.id) (RestoreOpportunity ref) model
 
         DismissUndo ->
             unchanged { model | undo = Nothing }
@@ -398,7 +380,7 @@ settle result model =
                             { ready | panel = Closed, undo = Just id }
 
                         RestoreItem id ->
-                            { ready | panel = Detail id, undo = Nothing, category = Nothing, kind = Nothing }
+                            { ready | panel = Detail id, undo = Nothing, category = Nothing, kind = Nothing, status = ActiveOnly }
 
                         ChangeItem ->
                             ready
@@ -519,7 +501,8 @@ endDrag pointerId point model =
         Moving drag bounds ->
             if drag.pointerId == pointerId then
                 if moved drag then
-                    submit ChangeItem (MoveOpportunity drag.ref (dragPlacement drag bounds))
+                    submit ChangeItem
+                        (MoveOpportunity drag.ref (dragPlacement drag bounds))
                         { model | skipClick = Just drag.ref.id }
 
                 else
@@ -624,8 +607,8 @@ keyboardPlacement direction step current =
             }
 
 
-view : SaveState -> Board -> Model -> Html Msg
-view saveState board model =
+view : SaveState -> User -> Board -> Model -> Html Msg
+view saveState user board model =
     let
         state =
             if saveState == Saving || model.request /= Idle then
@@ -636,8 +619,7 @@ view saveState board model =
 
         items =
             Dict.values board.opportunities
-                |> List.filter (\item -> not item.deleted)
-                |> List.sortBy (\item -> ( item.createdAt, item.id ))
+                |> List.filter (\item -> item.deleted == (model.status == DiscardedOnly))
 
         visible =
             List.filter
@@ -655,46 +637,104 @@ view saveState board model =
         ]
         [ Html.div [ Attr.class "flex flex-wrap items-start justify-between gap-4" ]
             [ Html.div []
-                [ Html.p [ Attr.class "text-xs font-semibold uppercase tracking-widest text-emerald-700" ] [ Html.text "Dónde enfocar tu esfuerzo" ]
+                [ Html.p [ Attr.class "text-sm font-semibold uppercase tracking-widest text-emerald-700" ] [ Html.text "Dónde enfocar tu esfuerzo" ]
                 , Html.h2 [ Attr.id "opportunities-heading", Attr.class "mt-1 text-xl font-semibold text-stone-900" ] [ Html.text "Oportunidades y responsabilidades" ]
-                , Html.p [ Attr.class "mt-1 text-sm text-stone-500" ] [ Html.text "Más fácil y más directa, hacia arriba a la derecha." ]
+                , Html.p [ Attr.class "mt-1 text-sm text-stone-500" ]
+                    [ Html.text
+                        (case model.status of
+                            ActiveOnly ->
+                                "Más fácil y más directa, hacia arriba a la derecha."
+
+                            DiscardedOnly ->
+                                "Elementos descartados, del más reciente al más antiguo."
+                        )
+                    ]
                 ]
-            , button state Add "Añadir" primary
+            , case model.status of
+                ActiveOnly ->
+                    button state Add "Añadir" primary
+
+                DiscardedOnly ->
+                    Html.text ""
             ]
         , Html.div [ Attr.class "my-4 flex flex-wrap gap-3" ]
-            [ filterButtons "Categoría" model.category FilterCategory [ ( Nothing, "Ambas" ), ( Just Ventex, "Ventex" ), ( Just Contractor, "Contratista" ) ]
+            [ filterButtons "Estado" model.status FilterStatus [ ( ActiveOnly, "Vigentes" ), ( DiscardedOnly, "Descartados" ) ]
+            , filterButtons "Categoría" model.category FilterCategory [ ( Nothing, "Ambas" ), ( Just Ventex, "Ventex" ), ( Just Contractor, "Contratista" ) ]
             , filterButtons "Tipo" model.kind FilterKind [ ( Nothing, "Ambas" ), ( Just OpportunityKind, "Oportunidades" ), ( Just Responsibility, "Responsabilidades" ) ]
             ]
-        , Html.p [ Attr.class "mb-4 text-xs text-stone-600" ]
-            [ Html.text (String.fromInt (List.length visible) ++ " elementos · Verde: Ventex · Ámbar: Contratista · R: responsabilidad · Borde punteado: por validar") ]
-        , viewError model.error
-        , viewUndo state board model.undo
-        , Html.div
-            [ Attr.class
-                (if model.panel == Closed then
-                    "grid min-w-0 gap-6"
+        , Html.p [ Attr.class "mb-4 text-sm text-stone-600" ]
+            [ Html.text
+                (String.fromInt (List.length visible)
+                    ++ (case model.status of
+                            ActiveOnly ->
+                                " elementos · Verde: Ventex · Ámbar: Contratista · R: responsabilidad · Borde punteado: por validar"
 
-                 else
-                    "grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1fr)_20rem]"
+                            DiscardedOnly ->
+                                " elementos descartados"
+                       )
                 )
             ]
-            [ viewMap state visible model
-            , viewPanel state board model.panel
-            ]
+        , viewError model.error
+        , viewUndo state board model.undo
+        , case model.status of
+            ActiveOnly ->
+                Html.div
+                    [ Attr.class
+                        (if model.panel == Closed then
+                            "grid min-w-0 gap-6"
+
+                         else
+                            "grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1fr)_20rem]"
+                        )
+                    ]
+                    [ viewMap state user (List.sortBy (\item -> ( item.createdAt, item.id )) visible) model
+                    , viewPanel state user board model.panel
+                    ]
+
+            DiscardedOnly ->
+                viewDiscarded state visible
         ]
 
 
-viewMap : SaveState -> List Opportunity -> Model -> Html Msg
-viewMap state items model =
+viewDiscarded : SaveState -> List Opportunity -> Html Msg
+viewDiscarded state items =
+    if List.isEmpty items then
+        Html.p [ Attr.class "rounded-lg bg-stone-50 p-6 text-center text-base text-stone-500" ]
+            [ Html.text "No hay elementos descartados en este filtro." ]
+
+    else
+        Html.ul [ Attr.class "divide-y divide-stone-200 rounded-lg border border-stone-200 px-4" ]
+            (items
+                |> List.sortBy (\item -> ( item.updatedAt, item.id ))
+                |> List.reverse
+                |> List.map
+                    (\item ->
+                        Html.li [ Attr.class "space-y-2 py-4" ]
+                            [ Html.div [ Attr.class "flex flex-wrap items-center gap-2" ]
+                                [ Html.h3 [ Attr.class "break-words font-medium text-stone-800" ] [ Html.text item.fields.title ]
+                                , Html.span [ Attr.class "rounded-full bg-stone-100 px-2 py-1 text-sm text-stone-600" ] [ Html.text "Descartado" ]
+                                ]
+                            , Html.p [ Attr.class "text-sm text-stone-500" ]
+                                [ Html.text (Domain.kindLabel item.fields.kind ++ " · " ++ Domain.categoryLabel item.fields.category) ]
+                            , Html.time [ Attr.datetime item.updatedAt, Attr.class "block text-sm text-stone-500" ]
+                                [ Html.text ("Descartado el " ++ (String.left 19 item.updatedAt |> String.replace "T" " ") ++ " UTC") ]
+                            , button state (Restore (Domain.ref item)) "Volver a vigentes" secondary
+                            ]
+                    )
+            )
+
+
+viewMap : SaveState -> User -> List Opportunity -> Model -> Html Msg
+viewMap state user items model =
     Html.div [ Attr.class "min-w-0" ]
-        [ Html.p [ Attr.class "mb-2 text-xs text-stone-600" ] [ Html.text "Beneficio cercano ↑ · 5: directa / corto plazo" ]
+        [ Html.p [ Attr.class "mb-2 text-sm text-stone-600" ] [ Html.text "Beneficio cercano ↑ · 5: directa / corto plazo" ]
         , Html.div [ Attr.class "overflow-x-auto pb-4" ]
-            [ Html.div [ Attr.class "grid min-w-[440px] grid-cols-[1.5rem_minmax(0,1fr)]" ]
-                [ Html.div [ Attr.class "grid h-[360px] grid-rows-5 items-center text-xs text-stone-500" ]
+            [ Html.div [ Attr.class "grid min-w-[600px] grid-cols-[1.5rem_minmax(0,1fr)]" ]
+                [ Html.div [ Attr.class "grid h-[440px] grid-rows-5 items-center text-sm text-stone-500" ]
                     (List.map (\number -> Html.span [] [ Html.text (String.fromInt number) ]) [ 5, 4, 3, 2, 1 ])
                 , Html.div
                     ([ Attr.id plotId
-                     , Attr.class "relative h-[360px] rounded-lg bg-stone-50"
+                     , Attr.class "relative h-[440px] rounded-lg bg-stone-50"
                      , Attr.attribute "role" "group"
                      , Attr.attribute "aria-label" "Mapa. Facilidad horizontal del 1 al 5; beneficio cercano vertical del 1 al 5."
                      ]
@@ -717,29 +757,29 @@ viewMap state items model =
                                 )
                         )
                         :: (if List.isEmpty items then
-                                [ Html.p [ Attr.class "pointer-events-none absolute inset-x-6 top-36 text-center text-sm text-stone-500" ] [ Html.text "No hay elementos en este filtro. Añade uno o cambia los filtros." ] ]
+                                [ Html.p [ Attr.class "pointer-events-none absolute inset-x-6 top-44 text-center text-base text-stone-500" ] [ Html.text "No hay elementos en este filtro. Añade uno o cambia los filtros." ] ]
 
                             else
-                                List.map (viewBubble state model) items
+                                List.map (viewBubble state user model) items
                            )
                     )
                 , Html.div [] []
-                , Html.div [ Attr.class "mt-2 grid grid-cols-5 text-center text-xs text-stone-500", Attr.attribute "aria-hidden" "true" ]
+                , Html.div [ Attr.class "mt-2 grid grid-cols-5 text-center text-sm text-stone-500", Attr.attribute "aria-hidden" "true" ]
                     (List.range 1 5 |> List.map (\number -> Html.span [] [ Html.text (String.fromInt number) ]))
                 ]
             ]
-        , Html.div [ Attr.class "flex justify-between gap-3 text-xs text-stone-600" ]
+        , Html.div [ Attr.class "flex justify-between gap-3 text-sm text-stone-600" ]
             [ Html.span [] [ Html.text "1: difícil / indirecta" ]
             , Html.strong [] [ Html.text "Facilidad →" ]
             , Html.span [] [ Html.text "5: fácil / simple" ]
             ]
-        , Html.p [ Attr.id "opportunity-map-help", Attr.class "mt-4 border-t border-stone-100 pt-3 text-xs leading-relaxed text-stone-500" ]
+        , Html.p [ Attr.id "opportunity-map-help", Attr.class "mt-4 border-t border-stone-100 pt-3 text-sm leading-relaxed text-stone-500" ]
             [ Html.text "Tamaño = potencial de comisión. Arrastra dentro del mapa para cambiar facilidad y cercanía; salir del mapa cancela. Flechas: una celda. Mayús + flechas: ajuste fino. Cambia el potencial en Editar." ]
         ]
 
 
-viewBubble : SaveState -> Model -> Opportunity -> Html Msg
-viewBubble state model item =
+viewBubble : SaveState -> User -> Model -> Opportunity -> Html Msg
+viewBubble state user model item =
     let
         point =
             case model.drag of
@@ -775,17 +815,29 @@ viewBubble state model item =
                 Editor (Existing ref) _ ->
                     ref.id == item.id
 
-                ConfirmRemoval ref ->
-                    ref.id == item.id
-
                 _ ->
                     False
     in
     Html.button
         ([ Attr.type_ "button"
          , Attr.disabled (state == Saving)
-         , Attr.class ("absolute z-10 -translate-x-1/2 -translate-y-1/2 cursor-grab rounded-full border-2 text-xs hover:z-20 focus:z-20 focus:outline-none focus:ring-4 focus:ring-emerald-200 disabled:cursor-wait " ++ color ++ if selected then " ring-2 ring-stone-800 ring-offset-2" else "")
-         , Attr.attribute "aria-pressed" (if selected then "true" else "false")
+         , Attr.class
+            ("absolute z-10 -translate-x-1/2 -translate-y-1/2 cursor-grab rounded-full border-2 text-sm hover:z-20 focus:z-20 focus:outline-none focus:ring-4 focus:ring-emerald-200 disabled:cursor-wait "
+                ++ color
+                ++ (if selected then
+                        " ring-2 ring-stone-800 ring-offset-2"
+
+                    else
+                        ""
+                   )
+            )
+         , Attr.attribute "aria-pressed"
+            (if selected then
+                "true"
+
+             else
+                "false"
+            )
          , Attr.style "left" (percent ((toFloat (Domain.rating point.x) - 0.5 + point.dx) * 20))
          , Attr.style "top" (percent ((5.5 - toFloat (Domain.rating point.y) + point.dy) * 20))
          , Attr.style "width" size
@@ -800,7 +852,21 @@ viewBubble state model item =
                 "solid"
             )
          , Attr.title description
-         , Attr.attribute "aria-label" (description ++ if item.fields.proposed then " Por validar." else "")
+         , Attr.attribute "aria-label"
+            (description
+                ++ (if item.fields.proposed then
+                        " Por validar."
+
+                    else
+                        ""
+                   )
+                ++ (if item.review == NeedsReview user then
+                        " Pendiente de tu revisión."
+
+                    else
+                        ""
+                   )
+            )
          , Attr.attribute "aria-describedby" "opportunity-map-help"
          , Events.onClick (Select item.id)
          ]
@@ -820,8 +886,10 @@ viewBubble state model item =
              else
                 ""
             )
-        , Html.span [ Attr.class "pointer-events-none absolute left-1/2 top-full mt-1 w-max max-w-[110px] -translate-x-1/2 rounded bg-white/90 px-1 text-center text-[10px] leading-tight" ]
+        , Html.span [ Attr.class "pointer-events-none absolute left-1/2 top-full mt-1 w-max max-w-[130px] -translate-x-1/2 rounded bg-white/90 px-1 text-center text-sm leading-tight" ]
             [ Html.text (item.fields.title |> String.words |> List.take 2 |> String.join " ") ]
+        , Html.span [ Attr.class "pointer-events-none absolute -right-1 -top-1" ]
+            [ reviewBadge user item.review ]
         ]
 
 
@@ -830,8 +898,8 @@ percent value =
     String.fromFloat value ++ "%"
 
 
-viewPanel : SaveState -> Board -> Panel -> Html Msg
-viewPanel state board panel =
+viewPanel : SaveState -> User -> Board -> Panel -> Html Msg
+viewPanel state user board panel =
     case panel of
         Closed ->
             Html.text ""
@@ -848,16 +916,7 @@ viewPanel state board panel =
                 [ viewEditor state fields ]
 
         Detail id ->
-            panelFrame state "Detalle" [ viewDetail state board id ]
-
-        ConfirmRemoval ref ->
-            panelFrame state "Eliminar elemento"
-                [ Html.p [ Attr.class "text-sm text-stone-700" ] [ Html.text "¿Eliminar este elemento del mapa? Podrás deshacerlo." ]
-                , Html.div [ Attr.class "mt-4 flex gap-2" ]
-                    [ button state Remove "Sí, eliminar" "rounded-lg bg-red-700 px-3 py-2 text-sm text-white"
-                    , button state (Select ref.id) "Cancelar" secondary
-                    ]
-                ]
+            panelFrame state "Detalle" [ viewDetail state user board id ]
 
 
 panelFrame : SaveState -> String -> List (Html Msg) -> Html Msg
@@ -865,7 +924,7 @@ panelFrame state title content =
     Html.aside [ Attr.class "min-w-0 rounded-xl border border-stone-200 bg-stone-50 p-4", Attr.attribute "aria-label" title ]
         (Html.div [ Attr.class "mb-4 flex items-center justify-between gap-3" ]
             [ Html.h3 [ Attr.class "font-semibold text-stone-900" ] [ Html.text title ]
-            , button state Close "Cerrar" "text-xs text-stone-600 underline"
+            , button state Close "Cerrar" "text-sm text-stone-600 underline"
             ]
             :: content
         )
@@ -877,13 +936,31 @@ viewEditor state fields =
         [ field "Nombre corto"
             (Html.input [ Attr.required True, Attr.maxlength 80, Attr.value fields.title, Attr.disabled (state == Saving), Attr.class inputClass, Events.onInput (SetText Title) ] [])
         , field "Tipo"
-            (choice state (kindValue fields.kind)
-                (\value -> SetKind (if value == "responsibility" then Responsibility else OpportunityKind))
+            (choice state
+                (kindValue fields.kind)
+                (\value ->
+                    SetKind
+                        (if value == "responsibility" then
+                            Responsibility
+
+                         else
+                            OpportunityKind
+                        )
+                )
                 [ ( "opportunity", "Oportunidad" ), ( "responsibility", "Responsabilidad" ) ]
             )
         , field "Categoría"
-            (choice state (Domain.categoryLabel fields.category)
-                (\value -> SetCategory (if value == "Contratista" then Contractor else Ventex))
+            (choice state
+                (Domain.categoryLabel fields.category)
+                (\value ->
+                    SetCategory
+                        (if value == "Contratista" then
+                            Contractor
+
+                         else
+                            Ventex
+                        )
+                )
                 [ ( "Ventex", "Ventex" ), ( "Contratista", "Contratista" ) ]
             )
         , Html.div [ Attr.class "grid grid-cols-3 gap-2" ]
@@ -891,47 +968,103 @@ viewEditor state fields =
             , ratingInput state Nearness "Cercanía" fields.y
             , ratingInput state Potential "Potencial" fields.z
             ]
-        , Html.label [ Attr.class "flex items-start gap-2 text-sm text-stone-700" ]
+        , Html.label [ Attr.class "flex items-start gap-2 text-base text-stone-700" ]
             [ Html.input
-                [ Attr.type_ "checkbox", Attr.checked fields.proposed, Attr.disabled (state == Saving)
-                , Events.onCheck (\checked -> SetValidation (if checked then Proposed else Validated))
+                [ Attr.type_ "checkbox"
+                , Attr.checked fields.proposed
+                , Attr.disabled (state == Saving)
+                , Events.onCheck
+                    (\checked ->
+                        SetValidation
+                            (if checked then
+                                Proposed
+
+                             else
+                                Validated
+                            )
+                    )
                 ]
                 []
-            , Html.span [] [ Html.text "Por validar", Html.small [ Attr.class "block text-xs text-stone-500" ] [ Html.text "Valor sugerido; no es una comisión confirmada." ] ]
+            , Html.span [] [ Html.text "Por validar", Html.small [ Attr.class "block text-sm text-stone-500" ] [ Html.text "Valor sugerido; no es una comisión confirmada." ] ]
             ]
         , field "Notas (opcional)"
             (Html.textarea [ Attr.rows 4, Attr.maxlength 2000, Attr.value fields.notes, Attr.disabled (state == Saving), Attr.class inputClass, Events.onInput (SetText Notes) ] [])
         , field "Fuente o enlace (opcional)"
             (Html.input [ Attr.type_ "url", Attr.maxlength 2000, Attr.value fields.source, Attr.disabled (state == Saving), Attr.placeholder "https://…", Attr.class inputClass, Events.onInput (SetText Source) ] [])
         , Html.div [ Attr.class "flex gap-2" ]
-            [ Html.button [ Attr.type_ "submit", Attr.disabled (state == Saving || String.isEmpty (String.trim fields.title)), Attr.class primary ] [ Html.text (if state == Saving then "Guardando…" else "Guardar") ]
+            [ Html.button [ Attr.type_ "submit", Attr.disabled (state == Saving || String.isEmpty (String.trim fields.title)), Attr.class primary ]
+                [ Html.text
+                    (if state == Saving then
+                        "Guardando…"
+
+                     else
+                        "Guardar"
+                    )
+                ]
             , button state Close "Cancelar" secondary
             ]
         ]
 
 
-viewDetail : SaveState -> Board -> String -> Html Msg
-viewDetail state board id =
+viewDetail : SaveState -> User -> Board -> String -> Html Msg
+viewDetail state user board id =
     case active id board of
         Nothing ->
-            Html.p [ Attr.class "text-sm text-stone-500" ] [ Html.text "Este elemento ya no está disponible." ]
+            Html.p [ Attr.class "text-base text-stone-500" ] [ Html.text "Este elemento ya no está disponible." ]
 
         Just item ->
             Html.div [ Attr.class "space-y-4" ]
-                [ Html.p [ Attr.class "text-xs text-stone-500" ] [ Html.text (Domain.kindLabel item.fields.kind ++ " · " ++ Domain.categoryLabel item.fields.category) ]
-                , Html.h4 [ Attr.class "break-words text-lg font-semibold text-stone-900" ] [ Html.text item.fields.title ]
+                [ Html.p [ Attr.class "text-sm text-stone-500" ] [ Html.text (Domain.kindLabel item.fields.kind ++ " · " ++ Domain.categoryLabel item.fields.category) ]
+                , Html.h4 [ Attr.class "break-words text-lg font-semibold text-stone-900" ]
+                    [ Html.text item.fields.title, Html.text " ", reviewBadge user item.review ]
                 , Html.dl [ Attr.class "grid grid-cols-3 gap-2 rounded-lg bg-white p-3 text-center" ]
                     [ score "Facilidad" item.fields.x, score "Cercanía" item.fields.y, score "Potencial" item.fields.z ]
-                , Html.p [ Attr.class "whitespace-pre-wrap break-words text-sm leading-relaxed text-stone-600" ] [ Html.text item.fields.notes ]
+                , Html.p [ Attr.class "whitespace-pre-wrap break-words text-base leading-relaxed text-stone-600" ] [ Html.text item.fields.notes ]
                 , sourceLink item.fields.source
-                , if item.fields.proposed then
-                    button state (Validate id) "✓ Validar elemento" "w-full rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"
+                , viewReview state user item
+                , button state (Edit id) "Editar calificaciones y datos" (primary ++ " w-full")
+                , if item.review == NeedsReview user then
+                    Html.text ""
 
                   else
-                    Html.p [ Attr.class "text-xs text-emerald-700" ] [ Html.text "Validado" ]
-                , button state (Edit id) "Editar calificaciones y datos" (primary ++ " w-full")
-                , button state (AskRemove id) "Eliminar" "text-sm text-red-700 underline"
+                    button state (Discard (Domain.ref item)) "Descartar" "text-base text-red-700 underline"
                 ]
+
+
+reviewBadge : User -> Review -> Html msg
+reviewBadge user review =
+    if review == NeedsReview user then
+        Html.span
+            [ Attr.class "inline-flex h-5 w-5 items-center justify-center rounded-full bg-amber-600 text-sm font-bold text-white"
+            , Attr.title "Pendiente de tu revisión"
+            , Attr.attribute "role" "img"
+            , Attr.attribute "aria-label" "Pendiente de tu revisión"
+            ]
+            [ Html.text "!" ]
+
+    else
+        Html.text ""
+
+
+viewReview : SaveState -> User -> Opportunity -> Html Msg
+viewReview state user item =
+    case item.review of
+        NeedsReview reviewer ->
+            if reviewer == user then
+                Html.div [ Attr.class "flex flex-wrap items-center gap-3" ]
+                    [ button state (Confirm (Domain.ref item)) "Confirmar elemento" primary
+                    , button state (Discard (Domain.ref item)) "Descartar" "text-base text-red-700 underline"
+                    ]
+
+            else
+                Html.p [ Attr.class "text-sm text-stone-600" ] [ Html.text "Pendiente de revisión del otro usuario." ]
+
+        Reviewed ->
+            if item.fields.proposed then
+                button state (Validate (Domain.ref item)) "✓ Validar elemento" "w-full rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-base text-emerald-800"
+
+            else
+                Html.p [ Attr.class "text-sm text-emerald-700" ] [ Html.text "Validado" ]
 
 
 sourceLink : String -> Html msg
@@ -942,16 +1075,16 @@ sourceLink source =
     else
         case Url.fromString source of
             Just url ->
-                Html.a [ Attr.href (Url.toString url), Attr.target "_blank", Attr.rel "noopener noreferrer", Attr.class "block text-sm text-emerald-800 underline" ] [ Html.text "Ver correo o fuente ↗" ]
+                Html.a [ Attr.href (Url.toString url), Attr.target "_blank", Attr.rel "noopener noreferrer", Attr.class "block text-base text-emerald-800 underline" ] [ Html.text "Ver correo o fuente ↗" ]
 
             Nothing ->
-                Html.p [ Attr.class "break-words text-sm text-stone-600" ] [ Html.text source ]
+                Html.p [ Attr.class "break-words text-base text-stone-600" ] [ Html.text source ]
 
 
 score : String -> Rating -> Html msg
 score label rating =
     Html.div []
-        [ Html.dt [ Attr.class "text-xs text-stone-500" ] [ Html.text label ]
+        [ Html.dt [ Attr.class "text-sm text-stone-500" ] [ Html.text label ]
         , Html.dd [ Attr.class "mt-1 text-xl text-stone-800" ] [ Html.text (String.fromInt (Domain.rating rating) ++ "/5") ]
         ]
 
@@ -961,10 +1094,10 @@ viewUndo state board maybeId =
     case maybeId |> Maybe.andThen (\id -> Dict.get id board.opportunities) of
         Just item ->
             if item.deleted then
-                Html.div [ Attr.class "mb-4 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-900", Attr.attribute "role" "status" ]
-                    [ Html.span [] [ Html.text ("«" ++ item.fields.title ++ "» eliminado.") ]
-                    , button state Undo "Deshacer" "font-semibold underline"
-                    , button state DismissUndo "Cerrar aviso" "ml-auto text-xs underline"
+                Html.div [ Attr.class "mb-4 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3 text-base text-emerald-900", Attr.attribute "role" "status" ]
+                    [ Html.span [] [ Html.text ("«" ++ item.fields.title ++ "» descartado.") ]
+                    , button state (Restore (Domain.ref item)) "Deshacer" "font-semibold underline"
+                    , button state DismissUndo "Cerrar aviso" "ml-auto text-sm underline"
                     ]
 
             else
@@ -978,21 +1111,34 @@ viewError : Maybe String -> Html msg
 viewError error =
     case error of
         Just message ->
-            Html.p [ Attr.class "mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800", Attr.attribute "role" "alert" ] [ Html.text message ]
+            Html.p [ Attr.class "mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-base text-red-800", Attr.attribute "role" "alert" ] [ Html.text message ]
 
         Nothing ->
             Html.text ""
 
 
-filterButtons : String -> Maybe a -> (Maybe a -> Msg) -> List ( Maybe a, String ) -> Html Msg
+filterButtons : String -> a -> (a -> Msg) -> List ( a, String ) -> Html Msg
 filterButtons label selected toMsg options =
     Html.div [ Attr.class "flex flex-wrap gap-1 rounded-lg bg-stone-100 p-1", Attr.attribute "role" "group", Attr.attribute "aria-label" label ]
         (List.map
             (\( value, title ) ->
                 Html.button
-                    [ Attr.type_ "button", Events.onClick (toMsg value)
-                    , Attr.attribute "aria-pressed" (if selected == value then "true" else "false")
-                    , Attr.class (if selected == value then "rounded-md bg-white px-3 py-2 text-xs font-semibold text-emerald-800 shadow-sm" else "rounded-md px-3 py-2 text-xs text-stone-600 hover:bg-white")
+                    [ Attr.type_ "button"
+                    , Events.onClick (toMsg value)
+                    , Attr.attribute "aria-pressed"
+                        (if selected == value then
+                            "true"
+
+                         else
+                            "false"
+                        )
+                    , Attr.class
+                        (if selected == value then
+                            "rounded-md bg-white px-3 py-2 text-sm font-semibold text-emerald-800 shadow-sm"
+
+                         else
+                            "rounded-md px-3 py-2 text-sm text-stone-600 hover:bg-white"
+                        )
                     ]
                     [ Html.text title ]
             )
@@ -1007,7 +1153,7 @@ button state msg label classes =
 
 field : String -> Html msg -> Html msg
 field label input =
-    Html.label [ Attr.class "block text-sm text-stone-700" ] [ Html.span [ Attr.class "mb-1 block font-medium" ] [ Html.text label ], input ]
+    Html.label [ Attr.class "block text-base text-stone-700" ] [ Html.span [ Attr.class "mb-1 block font-medium" ] [ Html.text label ], input ]
 
 
 choice : SaveState -> String -> (String -> Msg) -> List ( String, String ) -> Html Msg
@@ -1019,7 +1165,8 @@ choice state current toMsg options =
 ratingInput : SaveState -> Axis -> String -> Rating -> Html Msg
 ratingInput state axis label rating =
     field label
-        (choice state (String.fromInt (Domain.rating rating))
+        (choice state
+            (String.fromInt (Domain.rating rating))
             (\value -> SetRating axis (String.toInt value |> Maybe.withDefault 3 |> Domain.fromRating))
             (List.range 1 5 |> List.map (\number -> ( String.fromInt number, String.fromInt number )))
         )
@@ -1037,17 +1184,17 @@ kindValue kind =
 
 inputClass : String
 inputClass =
-    "w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-emerald-600 focus:outline-none focus:ring-1 focus:ring-emerald-600 disabled:opacity-60"
+    "w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-base text-stone-900 focus:border-emerald-600 focus:outline-none focus:ring-1 focus:ring-emerald-600 disabled:opacity-60"
 
 
 primary : String
 primary =
-    "rounded-lg bg-emerald-800 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-900 disabled:opacity-50"
+    "rounded-lg bg-emerald-800 px-4 py-2 text-base font-medium text-white hover:bg-emerald-900 disabled:opacity-50"
 
 
 secondary : String
 secondary =
-    "rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-700 hover:bg-stone-100"
+    "rounded-lg border border-stone-300 bg-white px-3 py-2 text-base text-stone-700 hover:bg-stone-100"
 
 
 pointDecoder : Decode.Decoder Point
@@ -1107,17 +1254,33 @@ moveDecoder id =
             (\( key, shifted ) ->
                 let
                     step =
-                        if shifted then Fine else Cell
+                        if shifted then
+                            Fine
+
+                        else
+                            Cell
 
                     direction =
                         case key of
-                            "ArrowLeft" -> Just Left
-                            "ArrowRight" -> Just Right
-                            "ArrowUp" -> Just Up
-                            "ArrowDown" -> Just Down
-                            _ -> Nothing
+                            "ArrowLeft" ->
+                                Just Left
+
+                            "ArrowRight" ->
+                                Just Right
+
+                            "ArrowUp" ->
+                                Just Up
+
+                            "ArrowDown" ->
+                                Just Down
+
+                            _ ->
+                                Nothing
                 in
                 case direction of
-                    Just value -> Decode.succeed (MoveKey id value step)
-                    Nothing -> Decode.fail "Not an arrow key."
+                    Just value ->
+                        Decode.succeed (MoveKey id value step)
+
+                    Nothing ->
+                        Decode.fail "Not an arrow key."
             )

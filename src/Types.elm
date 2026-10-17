@@ -1,26 +1,28 @@
-module Types exposing (ActiveSession, BackendModel, BackendMsg(..), FrontendModel, FrontendMsg(..), LoginForm, LoginState(..), PrivateData, Session, ToBackend(..), ToFrontend(..), User(..), Work(..))
+module Types exposing (ActiveSession, BackendModel, BackendMsg(..), FrontendModel, FrontendMsg(..), LoginForm, LoginState(..), PrivateData, Session, Theme(..), ToBackend(..), ToFrontend(..), Work(..))
 
 import Browser exposing (UrlRequest)
 import Browser.Navigation exposing (Key)
 import Dashboard
 import Dict exposing (Dict)
-import Domain
+import Domain exposing (User)
 import File exposing (File)
 import Lamdera exposing (ClientId, SessionId)
 import Time
 import Url exposing (Url)
 
 
-type User
-    = UserOne
-    | UserTwo
-
-
 type alias FrontendModel =
     { key : Key
     , login : LoginState
     , nextRequest : Int
+    , theme : Theme
     }
+
+
+type Theme
+    = SystemTheme
+    | LightTheme
+    | DarkTheme
 
 
 
@@ -82,6 +84,7 @@ type FrontendMsg
     | PasswordChanged String
     | SignIn
     | SignOut
+    | ThemeChanged Theme
     | BoardMsg Dashboard.Msg
     | ImportBackup
     | BackupSelected Int File

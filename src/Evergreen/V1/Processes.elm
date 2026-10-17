@@ -14,11 +14,22 @@ type alias Draft =
 type Editor
     = Browsing
     | Creating Draft
-    | EditingReason Evergreen.V1.Domain.Ref String String
+
+
+type alias TipRef =
+    { process : String
+    , task : String
+    }
+
+
+type Tooltip
+    = Hidden
+    | Hovered TipRef
+    | Focused TipRef
 
 
 type Model
-    = Model Editor String
+    = Model Editor String Tooltip
 
 
 type Field
@@ -34,7 +45,8 @@ type Msg
     | Edit Field String
     | Create
     | ChangeStatus Evergreen.V1.Domain.Ref String Evergreen.V1.Domain.TaskChange
-    | EditReason Evergreen.V1.Domain.Ref String
-    | SetReason String
-    | SaveReason
-    | RetryReason
+    | HoverTip TipRef
+    | FocusTip TipRef
+    | LeaveTip TipRef
+    | BlurTip TipRef
+    | CloseTip

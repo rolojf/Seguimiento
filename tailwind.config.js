@@ -2,7 +2,11 @@
 module.exports = {
   content: ["./src/**/*.elm"],
   theme: {
-    extend: {},
+    extend: {
+      fontSize: {
+        sm: ["0.9rem", { lineHeight: "1.5rem" }],
+      },
+    },
   },
   plugins: [],
 }

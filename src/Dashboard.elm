@@ -1,6 +1,6 @@
-module Dashboard exposing (Model, Msg, init, notice, settle, update, view)
+module Dashboard exposing (Model, Msg, init, isLocal, notice, settle, subscriptions, update, view)
 
-import Domain exposing (Board, Change, SaveState)
+import Domain exposing (Board, Change, SaveState, User)
 import Html exposing (Html)
 import Html.Attributes as A
 import Opportunities
@@ -37,6 +37,27 @@ init =
     , active = Nothing
     , message = Nothing
     }
+
+
+isLocal : Msg -> Bool
+isLocal msg =
+    case msg of
+        ProcessMsg action ->
+            Processes.isLocal action
+
+        PendingMsg action ->
+            Pending.isLocal action
+
+        _ ->
+            False
+
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+    Sub.batch
+        [ Sub.map ProcessMsg (Processes.subscriptions model.processes)
+        , Sub.map PendingMsg (Pending.subscriptions model.pending)
+        ]
 
 
 update : Msg -> Board -> Model -> ( Model, Cmd Msg, Maybe Change )
@@ -102,21 +123,21 @@ notice message model =
     { model | message = Just message }
 
 
-view : SaveState -> Board -> Model -> Html Msg
-view state board model =
+view : SaveState -> User -> Board -> Model -> Html Msg
+view state user board model =
     Html.main_ [ A.class "mx-auto max-w-7xl space-y-7 px-4 py-7 sm:px-6" ]
         [ case model.message of
             Just (Err error) ->
-                Html.p [ A.attribute "role" "alert", A.class "rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" ] [ Html.text error ]
+                Html.p [ A.attribute "role" "alert", A.class "rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-base text-red-800" ] [ Html.text error ]
 
             Just (Ok message) ->
-                Html.p [ A.attribute "role" "status", A.class "text-sm text-slate-600" ] [ Html.text message ]
+                Html.p [ A.attribute "role" "status", A.class "text-base text-slate-600" ] [ Html.text message ]
 
             Nothing ->
                 Html.text ""
-        , Html.map OpportunityMsg (Opportunities.view state board model.opportunities)
-        , Html.map ProcessMsg (Processes.view state board model.processes)
-        , Html.map PendingMsg (Pending.view state board model.pending)
-        , Html.footer [ A.class "pb-6 text-center text-sm text-slate-500" ]
+        , Html.map OpportunityMsg (Opportunities.view state user board model.opportunities)
+        , Html.map ProcessMsg (Processes.view state user board model.processes)
+        , Html.map PendingMsg (Pending.view state user board model.pending)
+        , Html.footer [ A.class "pb-6 text-center text-base text-slate-500" ]
             [ Html.text "Los cambios se guardan en Lamdera y se comparten entre los dos usuarios." ]
         ]

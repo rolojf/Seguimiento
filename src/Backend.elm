@@ -4,11 +4,11 @@ import Access
 import Backup
 import BoardStore
 import Dict
-import Domain
+import Domain exposing (User)
 import Lamdera exposing (ClientId, SessionId)
 import Task
 import Time
-import Types exposing (BackendModel, BackendMsg(..), PrivateData, Session, ToBackend(..), ToFrontend(..), User)
+import Types exposing (BackendModel, BackendMsg(..), PrivateData, Session, ToBackend(..), ToFrontend(..))
 
 
 app =
@@ -40,7 +40,7 @@ update msg model =
 
         ApplyChange sid cid session request change now ->
             if sameSession sid session model then
-                case BoardStore.apply (BoardStore.timestamp now) change model.board of
+                case BoardStore.apply session.user (BoardStore.timestamp now) change model.board of
                     Ok board ->
                         accept cid request { model | board = board }
 
@@ -60,7 +60,16 @@ update msg model =
             else
                 case Backup.decode source of
                     Ok ( board, archive ) ->
-                        accept cid request { model | board = board, archive = archive }
+                        let
+                            -- Keep client revisions and IDs monotonic even after all rows were purged.
+                            restored =
+                                { board
+                                    | revision = model.board.revision + 1
+                                    , pendingOrderRevision = model.board.pendingOrderRevision + 1
+                                    , nextId = max model.board.nextId board.nextId
+                                }
+                        in
+                        accept cid request { model | board = restored, archive = archive }
 
                     Err error ->
                         reject cid request error model
