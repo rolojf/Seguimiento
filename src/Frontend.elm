@@ -11,6 +11,7 @@ import File.Select
 import Html exposing (Html)
 import Html.Attributes as Attr
 import Html.Events as Events
+import Json.Encode as Encode
 import Lamdera
 import Task
 import Types exposing (ActiveSession, FrontendModel, FrontendMsg(..), LoginForm, LoginState(..), PrivateData, Theme(..), ToBackend(..), ToFrontend(..), Work(..))
@@ -105,13 +106,16 @@ updateBoard : FrontendMsg -> ActiveSession -> FrontendModel -> ( FrontendModel, 
 updateBoard msg active model =
     case msg of
         BoardMsg action ->
-            if active.work /= Nothing && not (Dashboard.isLocal action) then
+            if
+                (active.work /= Nothing && not (Dashboard.isLocal action))
+                    || (Dashboard.isWaiting active.dashboard && not (Dashboard.isReview action || Dashboard.isLocal action))
+            then
                 ( model, Cmd.none )
 
             else
                 let
                     ( dashboard, cmd, change ) =
-                        Dashboard.update action active.data.board active.dashboard
+                        Dashboard.update active.data.user action active.data.board active.dashboard
 
                     updated =
                         { active | dashboard = dashboard }
@@ -126,7 +130,7 @@ updateBoard msg active model =
                         ( { model | login = SignedIn updated }, Cmd.map BoardMsg cmd )
 
         ImportBackup ->
-            if active.work == Nothing then
+            if active.work == Nothing && not (Dashboard.isWaiting active.dashboard) then
                 ( { model | nextRequest = model.nextRequest + 1 }
                 , File.Select.file [ "application/json" ] (BackupSelected model.nextRequest)
                 )
@@ -135,7 +139,7 @@ updateBoard msg active model =
                 ( model, Cmd.none )
 
         BackupSelected request file ->
-            if request /= model.nextRequest - 1 || active.work /= Nothing then
+            if request /= model.nextRequest - 1 || active.work /= Nothing || Dashboard.isWaiting active.dashboard then
                 ( model, Cmd.none )
 
             else if File.size file > 5 * 1024 * 1024 then
@@ -154,7 +158,7 @@ updateBoard msg active model =
                 ( model, Cmd.none )
 
         ExportBackup ->
-            if active.work == Nothing then
+            if active.work == Nothing && not (Dashboard.isWaiting active.dashboard) then
                 ( { model | login = SignedIn { active | work = Just (ExportRequest model.nextRequest) }, nextRequest = model.nextRequest + 1 }
                 , Lamdera.sendToBackend (ExportBoard model.nextRequest)
                 )
@@ -287,7 +291,19 @@ view model =
     { title = "Seguimiento · Lamdera"
     , body =
         [ Html.div [ Attr.class "app-shell min-h-screen", Attr.attribute "data-theme" (themeValue model.theme) ]
-            [ themeControl model.theme
+            [ Html.div
+                [ Attr.property "inert"
+                    (Encode.bool
+                        (case model.login of
+                            SignedIn active ->
+                                Dashboard.isModal active.dashboard
+
+                            _ ->
+                                False
+                        )
+                    )
+                ]
+                [ themeControl model.theme ]
             , case model.login of
                 CheckingSession ->
                     viewStatus "Comprobando sesión…"
@@ -438,7 +454,7 @@ viewDashboard active =
             Dict.isEmpty active.data.board.opportunities && Dict.isEmpty active.data.board.pending && Dict.isEmpty active.data.board.processes
     in
     Html.div [ Attr.class "min-h-screen bg-slate-50 text-slate-900" ]
-        [ Html.header [ Attr.class "border-b border-slate-200 bg-white" ]
+        [ Html.header [ Attr.class "border-b border-slate-200 bg-white", Attr.property "inert" (Encode.bool (Dashboard.isModal active.dashboard || Dashboard.isWaiting active.dashboard)) ]
             [ Html.div [ Attr.class "mx-auto max-w-7xl px-4 py-5 sm:px-6" ]
                 [ Html.div [ Attr.class "flex flex-wrap items-center justify-between gap-4" ]
                     [ Html.div []
@@ -489,7 +505,7 @@ userLabel : User -> String
 userLabel user =
     case user of
         UserOne ->
-            "usuario1"
+            "Rolo"
 
         UserTwo ->
-            "usuario2"
+            "Dot"

@@ -2,7 +2,7 @@ module Opportunities exposing (Model, Msg, init, settle, update, view)
 
 import Browser.Dom as Dom
 import Dict
-import Domain exposing (Board, Category(..), Change(..), Kind(..), Opportunity, OpportunityFields, Placement, Rating(..), Ref, Review(..), SaveState(..), Target(..), User)
+import Domain exposing (Board, Category(..), Change(..), CompletionProposal(..), Kind(..), Opportunity, OpportunityFields, Placement, Rating(..), Ref, Review(..), SaveState(..), Target(..), User(..))
 import Html exposing (Html)
 import Html.Attributes as Attr
 import Html.Events as Events
@@ -27,6 +27,7 @@ type alias Model =
 
 type ViewStatus
     = ActiveOnly
+    | CompletedOnly
     | DiscardedOnly
 
 
@@ -34,6 +35,12 @@ type Panel
     = Closed
     | Detail String
     | Editor Target OpportunityFields
+    | Confirmation Action Ref
+
+
+type Action
+    = Complete
+    | PermanentlyDelete
 
 
 type Request
@@ -45,6 +52,8 @@ type Intent
     = SaveForm Target
     | DeleteItem String
     | RestoreItem String
+    | CompleteItem String
+    | PurgeItem String
     | ChangeItem
 
 
@@ -116,6 +125,12 @@ type Msg
     | Confirm Ref
     | Discard Ref
     | Restore Ref
+    | Suggest Ref CompletionProposal
+    | AskComplete Ref
+    | AskPurge Ref
+    | ConfirmAction
+    | CancelAction
+    | Ignore
     | DismissUndo
     | StartDrag String Int Point
     | GotBounds Int (Result Dom.Error Dom.Element)
@@ -204,17 +219,20 @@ updateReady msg board model =
                 unchanged { model | panel = Detail id, error = Nothing, skipClick = Nothing }
 
         Add ->
-            unchanged
-                { model
-                    | panel =
-                        Editor New
-                            { blank
-                                | category = Maybe.withDefault Ventex model.category
-                                , kind = Maybe.withDefault OpportunityKind model.kind
-                            }
-                    , error = Nothing
-                    , drag = Still
-                }
+            ( { model
+                | panel =
+                    Editor New
+                        { blank
+                            | category = Maybe.withDefault Ventex model.category
+                            , kind = Maybe.withDefault OpportunityKind model.kind
+                        }
+                , status = ActiveOnly
+                , error = Nothing
+                , drag = Still
+              }
+            , Dom.focus "opportunity-title" |> Task.attempt (\_ -> Ignore)
+            , Nothing
+            )
 
         Edit id ->
             case active id board of
@@ -286,6 +304,37 @@ updateReady msg board model =
         Restore ref ->
             submit (RestoreItem ref.id) (RestoreOpportunity ref) model
 
+        Suggest ref proposal ->
+            submit ChangeItem (SuggestCompletion ref proposal) model
+
+        AskComplete ref ->
+            beginConfirmation Complete ref board model
+
+        AskPurge ref ->
+            beginConfirmation PermanentlyDelete ref board model
+
+        ConfirmAction ->
+            case model.panel of
+                Confirmation Complete ref ->
+                    submit (CompleteItem ref.id) (CompleteOpportunity ref) model
+
+                Confirmation PermanentlyDelete ref ->
+                    submit (PurgeItem ref.id) (PurgeOpportunity ref) model
+
+                _ ->
+                    unchanged model
+
+        CancelAction ->
+            case model.panel of
+                Confirmation _ ref ->
+                    unchanged { model | panel = Detail ref.id, error = Nothing }
+
+                _ ->
+                    unchanged model
+
+        Ignore ->
+            unchanged model
+
         DismissUndo ->
             unchanged { model | undo = Nothing }
 
@@ -323,6 +372,9 @@ updateReady msg board model =
         MoveKey id direction step ->
             case model.panel of
                 Editor _ _ ->
+                    unchanged model
+
+                Confirmation _ _ ->
                     unchanged model
 
                 _ ->
@@ -382,6 +434,12 @@ settle result model =
                         RestoreItem id ->
                             { ready | panel = Detail id, undo = Nothing, category = Nothing, kind = Nothing, status = ActiveOnly }
 
+                        CompleteItem id ->
+                            { ready | panel = Detail id, status = CompletedOnly, undo = Nothing }
+
+                        PurgeItem _ ->
+                            { ready | panel = Closed, undo = Nothing }
+
                         ChangeItem ->
                             ready
 
@@ -400,12 +458,36 @@ active id board =
     Dict.get id board.opportunities
         |> Maybe.andThen
             (\item ->
-                if item.deleted then
-                    Nothing
+                if Domain.opportunityActive item then
+                    Just item
 
                 else
-                    Just item
+                    Nothing
             )
+
+
+beginConfirmation : Action -> Ref -> Board -> Model -> ( Model, Cmd Msg, Maybe Change )
+beginConfirmation action reference board model =
+    case Dict.get reference.id board.opportunities of
+        Just item ->
+            if Domain.ref item == reference && actionAvailable action item then
+                unchanged { model | panel = Confirmation action reference, error = Nothing, drag = Still }
+
+            else
+                unchanged { model | error = Just "El elemento cambió. Revisa sus datos antes de continuar." }
+
+        Nothing ->
+            unchanged { model | panel = Closed, error = Just "Este elemento ya no está disponible." }
+
+
+actionAvailable : Action -> Opportunity -> Bool
+actionAvailable action item =
+    case action of
+        Complete ->
+            Domain.opportunityActive item
+
+        PermanentlyDelete ->
+            Domain.opportunityComplete item
 
 
 editFields : (OpportunityFields -> OpportunityFields) -> Model -> ( Model, Cmd Msg, Maybe Change )
@@ -453,6 +535,9 @@ startDrag : String -> Int -> Point -> Board -> Model -> ( Model, Cmd Msg, Maybe 
 startDrag id pointerId point board model =
     case model.panel of
         Editor _ _ ->
+            unchanged model
+
+        Confirmation _ _ ->
             unchanged model
 
         _ ->
@@ -619,7 +704,17 @@ view saveState user board model =
 
         items =
             Dict.values board.opportunities
-                |> List.filter (\item -> item.deleted == (model.status == DiscardedOnly))
+                |> List.filter
+                    (case model.status of
+                        ActiveOnly ->
+                            Domain.opportunityActive
+
+                        CompletedOnly ->
+                            Domain.opportunityComplete
+
+                        DiscardedOnly ->
+                            Domain.opportunityDiscarded
+                    )
 
         visible =
             List.filter
@@ -645,20 +740,27 @@ view saveState user board model =
                             ActiveOnly ->
                                 "Más fácil y más directa, hacia arriba a la derecha."
 
+                            CompletedOnly ->
+                                "Elementos completados, del más reciente al más antiguo."
+
                             DiscardedOnly ->
                                 "Elementos descartados, del más reciente al más antiguo."
                         )
                     ]
                 ]
-            , case model.status of
-                ActiveOnly ->
-                    button state Add "Añadir" primary
-
-                DiscardedOnly ->
-                    Html.text ""
+            , Html.button
+                [ Attr.id "opportunity-add"
+                , Attr.type_ "button"
+                , Attr.disabled (state == Saving || not (canAdd model))
+                , Attr.title "Añadir oportunidad (Ctrl+O)"
+                , Attr.attribute "aria-keyshortcuts" "Control+O"
+                , Attr.class (primary ++ " disabled:cursor-wait disabled:opacity-50")
+                , Events.onClick Add
+                ]
+                [ Html.text "Añadir ", Html.u [] [ Html.text "o" ], Html.text "portunidad" ]
             ]
         , Html.div [ Attr.class "my-4 flex flex-wrap gap-3" ]
-            [ filterButtons "Estado" model.status FilterStatus [ ( ActiveOnly, "Vigentes" ), ( DiscardedOnly, "Descartados" ) ]
+            [ filterButtons "Estado" model.status FilterStatus [ ( ActiveOnly, "Vigentes" ), ( CompletedOnly, "Completados" ), ( DiscardedOnly, "Descartados" ) ]
             , filterButtons "Categoría" model.category FilterCategory [ ( Nothing, "Ambas" ), ( Just Ventex, "Ventex" ), ( Just Contractor, "Contratista" ) ]
             , filterButtons "Tipo" model.kind FilterKind [ ( Nothing, "Ambas" ), ( Just OpportunityKind, "Oportunidades" ), ( Just Responsibility, "Responsabilidades" ) ]
             ]
@@ -668,6 +770,9 @@ view saveState user board model =
                     ++ (case model.status of
                             ActiveOnly ->
                                 " elementos · Verde: Ventex · Ámbar: Contratista · R: responsabilidad · Borde punteado: por validar"
+
+                            CompletedOnly ->
+                                " elementos completados"
 
                             DiscardedOnly ->
                                 " elementos descartados"
@@ -693,7 +798,56 @@ view saveState user board model =
 
             DiscardedOnly ->
                 viewDiscarded state visible
+
+            CompletedOnly ->
+                Html.div
+                    [ Attr.class
+                        (if model.panel == Closed then
+                            "grid min-w-0 gap-6"
+
+                         else
+                            "grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1fr)_20rem]"
+                        )
+                    ]
+                    [ viewCompleted state user visible
+                    , viewPanel state user board model.panel
+                    ]
         ]
+
+
+viewCompleted : SaveState -> User -> List Opportunity -> Html Msg
+viewCompleted state user items =
+    if List.isEmpty items then
+        Html.p [ Attr.class "rounded-lg bg-stone-50 p-6 text-center text-base text-stone-500" ]
+            [ Html.text "No hay elementos completados en este filtro." ]
+
+    else
+        Html.ul [ Attr.class "divide-y divide-stone-200 rounded-lg border border-stone-200 px-4" ]
+            (items
+                |> List.sortBy (\item -> ( item.updatedAt, item.id ))
+                |> List.reverse
+                |> List.map
+                    (\item ->
+                        Html.li [ Attr.class "space-y-2 py-4" ]
+                            [ Html.div [ Attr.class "flex flex-wrap items-center gap-2" ]
+                                [ Html.h3 [ Attr.class "break-words font-medium text-stone-800" ] [ Html.text item.fields.title ]
+                                , Html.span [ Attr.class "rounded-full bg-emerald-50 px-2 py-1 text-sm text-emerald-800" ] [ Html.text "Completado" ]
+                                ]
+                            , Html.p [ Attr.class "text-sm text-stone-500" ]
+                                [ Html.text (Domain.kindLabel item.fields.kind ++ " · " ++ Domain.categoryLabel item.fields.category) ]
+                            , Html.time [ Attr.datetime item.updatedAt, Attr.class "block text-sm text-stone-500" ]
+                                [ Html.text ("Completado el " ++ (String.left 19 item.updatedAt |> String.replace "T" " ") ++ " UTC") ]
+                            , Html.div [ Attr.class "flex flex-wrap gap-3" ]
+                                [ button state (Select item.id) "Ver detalle" secondary
+                                , if user == UserOne then
+                                    button state (AskPurge (Domain.ref item)) "Borrar definitivamente" "text-base text-red-700 underline"
+
+                                  else
+                                    Html.text ""
+                                ]
+                            ]
+                    )
+            )
 
 
 viewDiscarded : SaveState -> List Opportunity -> Html Msg
@@ -815,81 +969,141 @@ viewBubble state user model item =
                 Editor (Existing ref) _ ->
                     ref.id == item.id
 
+                Confirmation _ ref ->
+                    ref.id == item.id
+
                 _ ->
                     False
     in
-    Html.button
-        ([ Attr.type_ "button"
-         , Attr.disabled (state == Saving)
-         , Attr.class
-            ("absolute z-10 -translate-x-1/2 -translate-y-1/2 cursor-grab rounded-full border-2 text-sm hover:z-20 focus:z-20 focus:outline-none focus:ring-4 focus:ring-emerald-200 disabled:cursor-wait "
-                ++ color
-                ++ (if selected then
-                        " ring-2 ring-stone-800 ring-offset-2"
+    Html.div
+        [ Attr.class "absolute z-10 -translate-x-1/2 -translate-y-1/2 hover:z-20 focus-within:z-20"
+        , Attr.style "left" (percent ((toFloat (Domain.rating point.x) - 0.5 + point.dx) * 20))
+        , Attr.style "top" (percent ((5.5 - toFloat (Domain.rating point.y) + point.dy) * 20))
+        , Attr.style "width" size
+        , Attr.style "height" size
+        ]
+        [ Html.button
+            ([ Attr.type_ "button"
+             , Attr.disabled (state == Saving)
+             , Attr.class
+                ("relative h-full w-full cursor-grab rounded-full border-2 text-sm focus:outline-none focus:ring-4 focus:ring-emerald-200 disabled:cursor-wait "
+                    ++ color
+                    ++ (if selected then
+                            " ring-2 ring-stone-800 ring-offset-2"
+
+                        else
+                            ""
+                       )
+                )
+             , Attr.attribute "aria-pressed"
+                (if selected then
+                    "true"
+
+                 else
+                    "false"
+                )
+             , Attr.style "touch-action" "none"
+             , Attr.style "user-select" "none"
+             , Attr.style "border-style"
+                (if item.fields.proposed then
+                    "dashed"
+
+                 else
+                    "solid"
+                )
+             , Attr.title description
+             , Attr.attribute "aria-label"
+                (description
+                    ++ (if item.fields.proposed then
+                            " Por validar."
+
+                        else
+                            ""
+                       )
+                    ++ (if item.review == NeedsReview user then
+                            " Pendiente de tu revisión."
+
+                        else
+                            ""
+                       )
+                )
+             , Attr.attribute "aria-describedby" "opportunity-map-help"
+             , Events.onClick (Select item.id)
+             ]
+                ++ (if state == Ready then
+                        [ Events.on "pointerdown" (startDecoder item.id)
+                        , Events.custom "keydown" (keyEvent (moveDecoder item.id))
+                        ]
 
                     else
-                        ""
+                        []
                    )
             )
-         , Attr.attribute "aria-pressed"
-            (if selected then
-                "true"
+            [ Html.text
+                (if item.fields.kind == Responsibility then
+                    "R"
 
-             else
-                "false"
-            )
-         , Attr.style "left" (percent ((toFloat (Domain.rating point.x) - 0.5 + point.dx) * 20))
-         , Attr.style "top" (percent ((5.5 - toFloat (Domain.rating point.y) + point.dy) * 20))
-         , Attr.style "width" size
-         , Attr.style "height" size
-         , Attr.style "touch-action" "none"
-         , Attr.style "user-select" "none"
-         , Attr.style "border-style"
-            (if item.fields.proposed then
-                "dashed"
+                 else
+                    ""
+                )
+            , Html.span [ Attr.class "pointer-events-none absolute left-1/2 top-full mt-1 w-max max-w-[130px] -translate-x-1/2 rounded bg-white/90 px-1 text-center text-sm leading-tight" ]
+                [ Html.text (item.fields.title |> String.words |> List.take 2 |> String.join " ") ]
+            , Html.span [ Attr.class "pointer-events-none absolute -right-1 -top-1" ]
+                [ reviewBadge user item.review ]
+            ]
+        , completionControl state user item
+        ]
 
-             else
-                "solid"
-            )
-         , Attr.title description
-         , Attr.attribute "aria-label"
-            (description
-                ++ (if item.fields.proposed then
-                        " Por validar."
 
-                    else
-                        ""
-                   )
-                ++ (if item.review == NeedsReview user then
-                        " Pendiente de tu revisión."
+completionControl : SaveState -> User -> Opportunity -> Html Msg
+completionControl state user item =
+    let
+        label =
+            if user == UserTwo then
+                "Sugerir completado de «" ++ item.fields.title ++ "» a Rolo"
 
-                    else
-                        ""
-                   )
-            )
-         , Attr.attribute "aria-describedby" "opportunity-map-help"
-         , Events.onClick (Select item.id)
-         ]
-            ++ (if state == Ready then
-                    [ Events.on "pointerdown" (startDecoder item.id)
-                    , Events.custom "keydown" (keyEvent (moveDecoder item.id))
-                    ]
+            else if Domain.completionSuggested item then
+                "Dot sugiere completar «" ++ item.fields.title ++ "»"
 
-                else
-                    []
-               )
-        )
-        [ Html.text
-            (if item.fields.kind == Responsibility then
-                "R"
+            else
+                "Dot aún no sugiere completar «" ++ item.fields.title ++ "»"
 
-             else
-                ""
-            )
-        , Html.span [ Attr.class "pointer-events-none absolute left-1/2 top-full mt-1 w-max max-w-[130px] -translate-x-1/2 rounded bg-white/90 px-1 text-center text-sm leading-tight" ]
-            [ Html.text (item.fields.title |> String.words |> List.take 2 |> String.join " ") ]
-        , Html.span [ Attr.class "pointer-events-none absolute -right-1 -top-1" ]
-            [ reviewBadge user item.review ]
+        controlId =
+            "opportunity-completion-" ++ item.id
+    in
+    -- Keep the checkbox beside the button; its events never select or drag the bubble.
+    Html.label
+        [ Attr.for controlId
+        , Attr.title label
+        , Attr.class "absolute left-full top-1/2 ml-0.5 inline-flex -translate-y-1/2 items-center rounded bg-white/90 p-1"
+        , Events.stopPropagationOn "pointerdown" (Decode.succeed ( Ignore, True ))
+        , Events.stopPropagationOn "pointerup" (Decode.succeed ( Ignore, True ))
+        , Events.stopPropagationOn "click" (Decode.succeed ( Ignore, True ))
+        ]
+        [ Html.input
+            [ Attr.id controlId
+            , Attr.type_ "checkbox"
+            , Attr.checked (Domain.completionSuggested item)
+            , Attr.disabled (state == Saving || user /= UserTwo)
+            , Attr.class "h-[10px] w-[10px] accent-emerald-700"
+            , Attr.attribute "aria-label" label
+            , Events.custom "click"
+                (Decode.succeed
+                    { message =
+                        Suggest (Domain.ref item)
+                            (if Domain.completionSuggested item then
+                                NoCompletionProposal
+
+                             else
+                                CompletionProposed
+                            )
+                    , stopPropagation = True
+                    , preventDefault = True
+                    }
+                )
+            ]
+            []
+        , Html.span [ Attr.class "sr-only" ] [ Html.text label ]
         ]
 
 
@@ -918,6 +1132,58 @@ viewPanel state user board panel =
         Detail id ->
             panelFrame state "Detalle" [ viewDetail state user board id ]
 
+        Confirmation action reference ->
+            panelFrame state
+                (case action of
+                    Complete ->
+                        "Completar elemento"
+
+                    PermanentlyDelete ->
+                        "Borrar definitivamente"
+                )
+                [ viewConfirmation state user board action reference ]
+
+
+viewConfirmation : SaveState -> User -> Board -> Action -> Ref -> Html Msg
+viewConfirmation state user board action reference =
+    case Dict.get reference.id board.opportunities of
+        Nothing ->
+            Html.p [ Attr.class "text-base text-stone-600" ] [ Html.text "Este elemento ya no está disponible." ]
+
+        Just item ->
+            if user /= UserOne then
+                Html.p [ Attr.class "text-base text-stone-600" ] [ Html.text "Solo Rolo puede completar o borrar definitivamente un elemento." ]
+
+            else if Domain.ref item /= reference || not (actionAvailable action item) then
+                Html.div [ Attr.class "space-y-3", Attr.attribute "role" "alert" ]
+                    [ Html.p [ Attr.class "text-base text-stone-600" ] [ Html.text "El elemento cambió. Revisa la versión actual antes de volver a confirmar." ]
+                    , button state CancelAction "Volver al detalle" secondary
+                    ]
+
+            else
+                Html.div [ Attr.class "space-y-4" ]
+                    [ Html.p [ Attr.class "break-words font-semibold text-stone-900" ] [ Html.text item.fields.title ]
+                    , Html.p [ Attr.class "text-base text-stone-600" ]
+                        [ Html.text
+                            (case action of
+                                Complete ->
+                                    "Se retirará del mapa y quedará disponible en Completados, con todos sus datos."
+
+                                PermanentlyDelete ->
+                                    "Se eliminará definitivamente este elemento y sus datos. Esta acción no se puede deshacer."
+                            )
+                        ]
+                    , Html.div [ Attr.class "flex flex-wrap gap-3" ]
+                        [ case action of
+                            Complete ->
+                                button state ConfirmAction "Confirmar completado" primary
+
+                            PermanentlyDelete ->
+                                button state ConfirmAction "Borrar definitivamente" "rounded-lg bg-red-700 px-4 py-2 text-base font-medium text-white hover:bg-red-800"
+                        , button state CancelAction "Cancelar" secondary
+                        ]
+                    ]
+
 
 panelFrame : SaveState -> String -> List (Html Msg) -> Html Msg
 panelFrame state title content =
@@ -930,11 +1196,24 @@ panelFrame state title content =
         )
 
 
+canAdd : Model -> Bool
+canAdd model =
+    case model.panel of
+        Editor _ _ ->
+            False
+
+        Confirmation _ _ ->
+            False
+
+        _ ->
+            model.drag == Still
+
+
 viewEditor : SaveState -> OpportunityFields -> Html Msg
 viewEditor state fields =
     Html.form [ Events.onSubmit Save, Attr.class "space-y-4" ]
         [ field "Nombre corto"
-            (Html.input [ Attr.required True, Attr.maxlength 80, Attr.value fields.title, Attr.disabled (state == Saving), Attr.class inputClass, Events.onInput (SetText Title) ] [])
+            (Html.input [ Attr.id "opportunity-title", Attr.required True, Attr.maxlength 80, Attr.value fields.title, Attr.disabled (state == Saving), Attr.class inputClass, Events.onInput (SetText Title) ] [])
         , field "Tipo"
             (choice state
                 (kindValue fields.kind)
@@ -1008,7 +1287,7 @@ viewEditor state fields =
 
 viewDetail : SaveState -> User -> Board -> String -> Html Msg
 viewDetail state user board id =
-    case active id board of
+    case Dict.get id board.opportunities of
         Nothing ->
             Html.p [ Attr.class "text-base text-stone-500" ] [ Html.text "Este elemento ya no está disponible." ]
 
@@ -1016,19 +1295,60 @@ viewDetail state user board id =
             Html.div [ Attr.class "space-y-4" ]
                 [ Html.p [ Attr.class "text-sm text-stone-500" ] [ Html.text (Domain.kindLabel item.fields.kind ++ " · " ++ Domain.categoryLabel item.fields.category) ]
                 , Html.h4 [ Attr.class "break-words text-lg font-semibold text-stone-900" ]
-                    [ Html.text item.fields.title, Html.text " ", reviewBadge user item.review ]
+                    [ Html.text item.fields.title
+                    , Html.text " "
+                    , if Domain.opportunityActive item then
+                        reviewBadge user item.review
+
+                      else
+                        Html.text ""
+                    ]
                 , Html.dl [ Attr.class "grid grid-cols-3 gap-2 rounded-lg bg-white p-3 text-center" ]
                     [ score "Facilidad" item.fields.x, score "Cercanía" item.fields.y, score "Potencial" item.fields.z ]
                 , Html.p [ Attr.class "whitespace-pre-wrap break-words text-base leading-relaxed text-stone-600" ] [ Html.text item.fields.notes ]
                 , sourceLink item.fields.source
-                , viewReview state user item
-                , button state (Edit id) "Editar calificaciones y datos" (primary ++ " w-full")
-                , if item.review == NeedsReview user then
-                    Html.text ""
-
-                  else
-                    button state (Discard (Domain.ref item)) "Descartar" "text-base text-red-700 underline"
+                , detailActions state user item
                 ]
+
+
+detailActions : SaveState -> User -> Opportunity -> Html Msg
+detailActions state user item =
+    if Domain.opportunityComplete item then
+        Html.div [ Attr.class "space-y-3" ]
+            [ Html.p [ Attr.class "font-medium text-emerald-700" ] [ Html.text "Completado" ]
+            , if user == UserOne then
+                button state (AskPurge (Domain.ref item)) "Borrar definitivamente" "text-base text-red-700 underline"
+
+              else
+                Html.text ""
+            ]
+
+    else if Domain.opportunityDiscarded item then
+        Html.div [ Attr.class "space-y-3" ]
+            [ Html.p [ Attr.class "text-base text-stone-600" ] [ Html.text "Descartado" ]
+            , button state (Restore (Domain.ref item)) "Volver a vigentes" secondary
+            ]
+
+    else
+        Html.div [ Attr.class "space-y-4" ]
+            [ viewReview state user item
+            , button state (Edit item.id) "Editar calificaciones y datos" (primary ++ " w-full")
+            , if Domain.completionSuggested item then
+                Html.p [ Attr.class "text-base font-medium text-emerald-700" ] [ Html.text "Dot sugiere completar este elemento." ]
+
+              else
+                Html.text ""
+            , if user == UserOne then
+                button state (AskComplete (Domain.ref item)) "Completar" secondary
+
+              else
+                Html.text ""
+            , if item.review == NeedsReview user then
+                Html.text ""
+
+              else
+                button state (Discard (Domain.ref item)) "Descartar" "text-base text-red-700 underline"
+            ]
 
 
 reviewBadge : User -> Review -> Html msg
@@ -1093,7 +1413,7 @@ viewUndo : SaveState -> Board -> Maybe String -> Html Msg
 viewUndo state board maybeId =
     case maybeId |> Maybe.andThen (\id -> Dict.get id board.opportunities) of
         Just item ->
-            if item.deleted then
+            if Domain.opportunityDiscarded item then
                 Html.div [ Attr.class "mb-4 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3 text-base text-emerald-900", Attr.attribute "role" "status" ]
                     [ Html.span [] [ Html.text ("«" ++ item.fields.title ++ "» descartado.") ]
                     , button state (Restore (Domain.ref item)) "Deshacer" "font-semibold underline"

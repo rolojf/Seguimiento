@@ -11,9 +11,26 @@ type alias Draft =
     }
 
 
+type NotesAccess
+    = EditableNotes
+    | ReadOnlyNotes
+
+
+type alias NotesDraft =
+    { ref : Evergreen.V1.Domain.Ref
+    , task : String
+    , title : String
+    , notes : String
+    , opener : String
+    }
+
+
 type Editor
     = Browsing
     | Creating Draft
+    | TakingNotes NotesAccess NotesDraft
+    | Completing Evergreen.V1.Domain.Ref String
+    | Purging Evergreen.V1.Domain.Ref String
 
 
 type alias TipRef =
@@ -29,7 +46,13 @@ type Tooltip
 
 
 type Model
-    = Model Editor String Tooltip
+    = Model
+        { editor : Editor
+        , error : String
+        , tooltip : Tooltip
+        , filter : Evergreen.V1.Domain.ProcessStatus
+        , focus : Maybe String
+        }
 
 
 type Field
@@ -44,7 +67,18 @@ type Msg
     | Cancel
     | Edit Field String
     | Create
+    | SelectFilter Evergreen.V1.Domain.ProcessStatus
     | ChangeStatus Evergreen.V1.Domain.Ref String Evergreen.V1.Domain.TaskChange
+    | OpenNotes NotesAccess NotesDraft
+    | EditNotes String
+    | SaveNotes
+    | AskComplete Evergreen.V1.Domain.Ref String
+    | AskPurge Evergreen.V1.Domain.Ref String
+    | ConfirmAction
+    | CloseDialog
+    | FocusAt String
+    | FocusNext
+    | FocusedElement
     | HoverTip TipRef
     | FocusTip TipRef
     | LeaveTip TipRef

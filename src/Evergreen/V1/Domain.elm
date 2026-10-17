@@ -39,6 +39,17 @@ type alias OpportunityFields =
     }
 
 
+type CompletionProposal
+    = NoCompletionProposal
+    | CompletionProposed
+
+
+type OpportunityStatus
+    = ActiveOpportunity CompletionProposal
+    | DiscardedOpportunity
+    | CompletedOpportunity
+
+
 type Review
     = Reviewed
     | NeedsReview User
@@ -49,7 +60,7 @@ type alias Opportunity =
     , fields : OpportunityFields
     , dx : Float
     , dy : Float
-    , deleted : Bool
+    , status : OpportunityStatus
     , version : Int
     , createdAt : String
     , updatedAt : String
@@ -57,13 +68,15 @@ type alias Opportunity =
     }
 
 
-type Completion
-    = Todo
-    | Done
+type PendingStatus
+    = AwaitingApproval User
+    | Approved
+    | CompletedBy User Review
+    | LegacyCompleted
 
 
 type PendingContent
-    = PendingTask String Completion
+    = PendingTask String PendingStatus
     | Separator String
 
 
@@ -86,7 +99,6 @@ type alias Pending =
     , version : Int
     , createdAt : String
     , updatedAt : String
-    , review : Review
     , position : Int
     }
 
@@ -104,6 +116,16 @@ type alias ProcessFields =
     }
 
 
+type ProcessStatus
+    = ActiveProcess
+    | CompletedProcess
+
+
+type Completion
+    = Todo
+    | Done
+
+
 type Applicability
     = Applicable Completion
     | NotApplicable Completion
@@ -112,6 +134,7 @@ type Applicability
 type alias TaskState =
     { applicability : Applicability
     , evidence : Maybe String
+    , notes : String
     , applicabilityReview : Review
     , completionReview : Review
     }
@@ -125,6 +148,7 @@ type Closure
 type alias Process =
     { id : String
     , fields : ProcessFields
+    , status : ProcessStatus
     , states : Dict.Dict String TaskState
     , closure : Closure
     , legacySummary : String
@@ -164,6 +188,11 @@ type alias Placement =
     }
 
 
+type CompletionEdit
+    = KeepCompletion
+    | ChangeCompletion Completion
+
+
 type alias Archive =
     { checks : String
     , snapshots : String
@@ -200,12 +229,21 @@ type Change
     | ConfirmOpportunity Ref
     | RemoveOpportunity Ref
     | RestoreOpportunity Ref
-    | SavePending Target PendingFields PendingMove
+    | SuggestCompletion Ref CompletionProposal
+    | CompleteOpportunity Ref
+    | PurgeOpportunity Ref
+    | SavePending Target PendingFields PendingMove CompletionEdit
     | MovePending Ref PendingShift
-    | CompletePending Ref Completion
+    | TogglePending Ref
+    | RejectPendingCompletion Ref
     | ConfirmPending Ref
     | RemovePending Ref
     | RestorePending Ref
     | PurgePending Ref
+    | PurgeCompleted Owner Ref
+    | PurgeSeparator Ref
     | CreateProcess ProcessFields
     | ChangeTask Ref String TaskChange
+    | CompleteProcess Ref
+    | PurgeProcess Ref
+    | SaveTaskNotes Ref String String

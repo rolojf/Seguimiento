@@ -1,6 +1,7 @@
 /dist
 /.env
 /.local/
+/respaldos/
 /elm-stuff
 /node_modules
 .DS_Store

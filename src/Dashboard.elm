@@ -1,8 +1,9 @@
-module Dashboard exposing (Model, Msg, init, isLocal, notice, settle, subscriptions, update, view)
+module Dashboard exposing (Model, Msg, init, isLocal, isModal, isReview, isWaiting, notice, settle, subscriptions, update, view)
 
-import Domain exposing (Board, Change, SaveState, User)
+import Domain exposing (Board, Change, SaveState(..), User)
 import Html exposing (Html)
 import Html.Attributes as A
+import Json.Encode as Encode
 import Opportunities
 import Pending
 import Processes
@@ -39,6 +40,26 @@ init =
     }
 
 
+isModal : Model -> Bool
+isModal model =
+    Processes.isModal model.processes
+
+
+isWaiting : Model -> Bool
+isWaiting model =
+    Pending.isWaiting model.pending
+
+
+isReview : Msg -> Bool
+isReview msg =
+    case msg of
+        PendingMsg action ->
+            Pending.isReview action
+
+        _ ->
+            False
+
+
 isLocal : Msg -> Bool
 isLocal msg =
     case msg of
@@ -60,8 +81,8 @@ subscriptions model =
         ]
 
 
-update : Msg -> Board -> Model -> ( Model, Cmd Msg, Maybe Change )
-update msg board model =
+update : User -> Msg -> Board -> Model -> ( Model, Cmd Msg, Maybe Change )
+update user msg board model =
     case msg of
         OpportunityMsg action ->
             let
@@ -75,17 +96,17 @@ update msg board model =
 
         ProcessMsg action ->
             let
-                ( section, change ) =
+                ( section, cmd, change ) =
                     Processes.update action board model.processes
             in
-            ( markActive ProcessSection change { model | processes = section }, Cmd.none, change )
+            ( markActive ProcessSection change { model | processes = section }, Cmd.map ProcessMsg cmd, change )
 
         PendingMsg action ->
             let
-                ( section, change ) =
-                    Pending.update action board model.pending
+                ( section, cmd, change ) =
+                    Pending.update user action board model.pending
             in
-            ( markActive PendingSection change { model | pending = section }, Cmd.none, change )
+            ( markActive PendingSection change { model | pending = section }, Cmd.map PendingMsg cmd, change )
 
 
 markActive : Section -> Maybe Change -> Model -> Model
@@ -125,6 +146,14 @@ notice message model =
 
 view : SaveState -> User -> Board -> Model -> Html Msg
 view state user board model =
+    let
+        sectionState =
+            if isWaiting model then
+                Saving
+
+            else
+                state
+    in
     Html.main_ [ A.class "mx-auto max-w-7xl space-y-7 px-4 py-7 sm:px-6" ]
         [ case model.message of
             Just (Err error) ->
@@ -135,9 +164,11 @@ view state user board model =
 
             Nothing ->
                 Html.text ""
-        , Html.map OpportunityMsg (Opportunities.view state user board model.opportunities)
-        , Html.map ProcessMsg (Processes.view state user board model.processes)
-        , Html.map PendingMsg (Pending.view state user board model.pending)
+        , Html.div [ A.property "inert" (Encode.bool (isModal model)) ]
+            [ Html.map OpportunityMsg (Opportunities.view sectionState user board model.opportunities) ]
+        , Html.map ProcessMsg (Processes.view sectionState user board model.processes)
+        , Html.div [ A.property "inert" (Encode.bool (isModal model)) ]
+            [ Html.map PendingMsg (Pending.view state user board model.pending) ]
         , Html.footer [ A.class "pb-6 text-center text-base text-slate-500" ]
             [ Html.text "Los cambios se guardan en Lamdera y se comparten entre los dos usuarios." ]
         ]

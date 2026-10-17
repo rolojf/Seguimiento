@@ -15,6 +15,11 @@ formatName =
 
 formatVersion : Int
 formatVersion =
+    3
+
+
+previousVersion : Int
+previousVersion =
     2
 
 
@@ -38,6 +43,16 @@ snapshotVersion =
     1
 
 
+maxTaskNotes : Int
+maxTaskNotes =
+    10000
+
+
+type RowFormat
+    = LegacyRows
+    | CurrentRows
+
+
 decode : String -> Result String ( Board, Archive )
 decode source =
     D.decodeString backupDecoder source |> Result.mapError decodeError
@@ -49,7 +64,14 @@ backupDecoder =
         |> D.andThen
             (\( format, version ) ->
                 if format == formatName && version == formatVersion then
-                    currentBackup
+                    currentBackup CurrentRows (rows (pendingDecoder pendingContent) |> verified validPendingOrder)
+
+                else if format == formatName && version == previousVersion then
+                    currentBackup LegacyRows
+                        (rows (pendingDecoder previousContent)
+                            |> verified validPreviousOrder
+                            |> D.map reindexPending
+                        )
 
                 else if format == legacyFormat && version == legacyVersion then
                     legacyBackup
@@ -65,18 +87,18 @@ legacyBackup =
         []
         (D.map2 (\_ tables -> tables)
             (D.field "exportedAt" timestampDecoder)
-            (D.field "tables" (tablesDecoder (rows legacyPending |> D.map legacyPendingOrder)))
+            (D.field "tables" (tablesDecoder LegacyRows (rows legacyPending |> D.map reindexPending)))
         )
 
 
-currentBackup : Decoder ( Board, Archive )
-currentBackup =
+currentBackup : RowFormat -> Decoder (Dict String Pending) -> Decoder ( Board, Archive )
+currentBackup rowFormat pendingRows =
     strict [ "format", "formatVersion", "exportedAt", "nextId", "tables" ]
         []
         (D.map3 (\_ nextId tables -> ( nextId, tables ))
             (D.field "exportedAt" timestampDecoder)
             (D.field "nextId" positiveInt)
-            (D.field "tables" (tablesDecoder (rows pendingDecoder |> verified validPendingOrder)))
+            (D.field "tables" (tablesDecoder rowFormat pendingRows))
             |> D.andThen
                 (\( nextId, ( board, archive ) ) ->
                     if nextId >= board.nextId then
@@ -88,8 +110,8 @@ currentBackup =
         )
 
 
-tablesDecoder : Decoder (Dict String Pending) -> Decoder ( Board, Archive )
-tablesDecoder pendingRows =
+tablesDecoder : RowFormat -> Decoder (Dict String Pending) -> Decoder ( Board, Archive )
+tablesDecoder rowFormat pendingRows =
     strict [ "checks", "opportunities", "pending", "processes", "process_snapshots" ]
         []
         (D.map5
@@ -109,31 +131,106 @@ tablesDecoder pendingRows =
                 )
             )
             (D.field "checks" (archiveRows checkDecoder))
-            (D.field "opportunities" (rows opportunityDecoder))
+            (D.field "opportunities" (rows (opportunityDecoder rowFormat)))
             (D.field "pending" pendingRows)
-            (D.field "processes" (rows processDecoder))
+            (D.field "processes" (rows (processDecoder rowFormat)))
             (D.field "process_snapshots" (archiveRows snapshotDecoder))
         )
 
 
-opportunityDecoder : Decoder Opportunity
-opportunityDecoder =
+opportunityDecoder : RowFormat -> Decoder Opportunity
+opportunityDecoder format =
+    let
+        extra =
+            case format of
+                LegacyRows ->
+                    []
+
+                CurrentRows ->
+                    [ "status", "completionSuggested" ]
+    in
     strict
         [ "id", "title", "category", "kind", "x", "y", "z", "dx", "dy", "notes", "source", "proposed", "version", "deleted", "created_at", "updated_at" ]
-        []
+        extra
         (D.map8
-            (\id fields dx dy deleted version createdAt updatedAt ->
-                Opportunity id fields dx dy deleted version createdAt updatedAt Reviewed
+            (\id fields dx dy status version createdAt updatedAt ->
+                Opportunity id fields dx dy status version createdAt updatedAt Reviewed
             )
             (D.field "id" identifier)
             opportunityFields
             (D.field "dx" offsetDecoder)
             (D.field "dy" offsetDecoder)
-            (D.field "deleted" sqliteBool)
+            (opportunityState format)
             (D.field "version" positiveInt)
             (D.field "created_at" timestampDecoder)
             (D.field "updated_at" timestampDecoder)
         )
+
+
+opportunityState : RowFormat -> Decoder OpportunityStatus
+opportunityState format =
+    let
+        legacy =
+            D.field "deleted" sqliteBool
+                |> D.map
+                    (\deleted ->
+                        if deleted then
+                            DiscardedOpportunity
+
+                        else
+                            ActiveOpportunity NoCompletionProposal
+                    )
+    in
+    case format of
+        LegacyRows ->
+            legacy
+
+        CurrentRows ->
+            -- Older version 3 rows infer their state from deleted and have no proposal.
+            D.map3
+                (\old explicit suggested ->
+                    let
+                        status =
+                            Maybe.withDefault old explicit
+                    in
+                    if (status == DiscardedOpportunity) /= (old == DiscardedOpportunity) then
+                        D.fail "El estado de la oportunidad contradice deleted."
+
+                    else if Maybe.withDefault False suggested then
+                        case status of
+                            ActiveOpportunity _ ->
+                                D.succeed (ActiveOpportunity CompletionProposed)
+
+                            _ ->
+                                D.fail "Solo una oportunidad activa puede tener una propuesta de cumplimiento."
+
+                    else
+                        D.succeed status
+                )
+                legacy
+                (optional "status" oppStatusDecoder)
+                (optional "completionSuggested" D.bool)
+                |> D.andThen identity
+
+
+oppStatusDecoder : Decoder OpportunityStatus
+oppStatusDecoder =
+    D.string
+        |> D.andThen
+            (\status ->
+                case status of
+                    "active" ->
+                        D.succeed (ActiveOpportunity NoCompletionProposal)
+
+                    "discarded" ->
+                        D.succeed DiscardedOpportunity
+
+                    "completed" ->
+                        D.succeed CompletedOpportunity
+
+                    _ ->
+                        D.fail "Estado de oportunidad no reconocido."
+            )
 
 
 opportunityFields : Decoder OpportunityFields
@@ -157,24 +254,13 @@ legacyPending =
         []
         (D.map6
             (\id fields deleted version createdAt updatedAt ->
-                Pending id fields deleted version createdAt updatedAt Reviewed 0
+                Pending id fields deleted version createdAt updatedAt 0
             )
             (D.field "id" identifier)
-            (D.map3 (\title owner completion -> PendingFields (PendingTask title completion) owner)
+            (D.map3 (\title owner status -> PendingFields (PendingTask title status) owner)
                 (D.field "title" D.string)
                 (D.field "owner" ownerDecoder)
-                (D.field "done"
-                    (D.map
-                        (\done ->
-                            if done then
-                                Done
-
-                            else
-                                Todo
-                        )
-                        sqliteBool
-                    )
-                )
+                (D.field "done" oldPendingStatus)
                 |> verified BoardStore.validatePending
             )
             (D.field "deleted" sqliteBool)
@@ -184,17 +270,17 @@ legacyPending =
         )
 
 
-pendingDecoder : Decoder Pending
-pendingDecoder =
+pendingDecoder : Decoder PendingContent -> Decoder Pending
+pendingDecoder contentDecoder =
     strict [ "id", "content", "owner", "position", "version", "deleted", "created_at", "updated_at" ]
         []
         (D.map7
             (\id fields deleted version createdAt updatedAt position ->
-                Pending id fields deleted version createdAt updatedAt Reviewed position
+                Pending id fields deleted version createdAt updatedAt position
             )
             (D.field "id" identifier)
             (D.map2 PendingFields
-                (D.field "content" pendingContent)
+                (D.field "content" contentDecoder)
                 (D.field "owner" ownerDecoder)
                 |> verified BoardStore.validatePending
             )
@@ -208,27 +294,26 @@ pendingDecoder =
 
 pendingContent : Decoder PendingContent
 pendingContent =
+    contentWith "status" pendingStatus
+
+
+previousContent : Decoder PendingContent
+previousContent =
+    contentWith "done" oldPendingStatus
+
+
+contentWith : String -> Decoder PendingStatus -> Decoder PendingContent
+contentWith statusField statusDecoder =
     D.field "type" D.string
         |> D.andThen
             (\kind ->
                 case kind of
                     "task" ->
-                        strict [ "type", "title", "done" ]
+                        strict [ "type", "title", statusField ]
                             []
                             (D.map2 PendingTask
                                 (D.field "title" D.string)
-                                (D.field "done"
-                                    (D.map
-                                        (\done ->
-                                            if done then
-                                                Done
-
-                                            else
-                                                Todo
-                                        )
-                                        sqliteBool
-                                    )
-                                )
+                                (D.field statusField statusDecoder)
                             )
 
                     "separator" ->
@@ -241,12 +326,99 @@ pendingContent =
             )
 
 
+oldPendingStatus : Decoder PendingStatus
+oldPendingStatus =
+    D.map
+        (\done ->
+            if done then
+                LegacyCompleted
 
--- D1 had no position column; preserve its original created_at/id ordering.
+            else
+                Approved
+        )
+        sqliteBool
 
 
-legacyPendingOrder : Dict String Pending -> Dict String Pending
-legacyPendingOrder items =
+pendingStatus : Decoder PendingStatus
+pendingStatus =
+    D.field "type" D.string
+        |> D.andThen
+            (\status ->
+                case status of
+                    "awaitingApproval" ->
+                        strict [ "type", "user" ]
+                            []
+                            (D.map AwaitingApproval (D.field "user" userDecoder))
+
+                    "approved" ->
+                        strict [ "type" ] [] (D.succeed Approved)
+
+                    "completed" ->
+                        strict [ "type", "by", "review" ]
+                            []
+                            (D.map2 Tuple.pair
+                                (D.field "by" userDecoder)
+                                (D.field "review" D.string)
+                                |> D.andThen (\( by, review ) -> completedStatus by review)
+                            )
+
+                    "legacyCompleted" ->
+                        strict [ "type" ] [] (D.succeed LegacyCompleted)
+
+                    _ ->
+                        D.fail "Estado de pendiente no reconocido."
+            )
+
+
+completedStatus : User -> String -> Decoder PendingStatus
+completedStatus by review =
+    case review of
+        "reviewed" ->
+            D.succeed (CompletedBy by Reviewed)
+
+        "pending" ->
+            -- The completer cannot also be the user asked to confirm completion.
+            D.succeed
+                (CompletedBy by
+                    (NeedsReview
+                        (case by of
+                            UserOne ->
+                                UserTwo
+
+                            UserTwo ->
+                                UserOne
+                        )
+                    )
+                )
+
+        _ ->
+            D.fail "La revisión de cumplimiento debe ser reviewed o pending."
+
+
+userDecoder : Decoder User
+userDecoder =
+    D.string
+        |> D.andThen
+            (\name ->
+                case name of
+                    "Rolo" ->
+                        D.succeed UserOne
+
+                    "Dot" ->
+                        D.succeed UserTwo
+
+                    _ ->
+                        D.fail "El usuario debe ser Rolo o Dot."
+            )
+
+
+
+-- Keep the old relative order while completed rows leave the active list.
+-- D1 positions start at zero, so its original created_at/id order is retained.
+
+
+reindexPending : Dict String Pending -> Dict String Pending
+reindexPending items =
     List.foldl
         (\owner result ->
             orderedPending owner { empty | pending = result }
@@ -259,11 +431,27 @@ legacyPendingOrder items =
 
 validPendingOrder : Dict String Pending -> Result String ()
 validPendingOrder items =
+    validateOrder (\owner -> orderedPending owner { empty | pending = items })
+
+
+validPreviousOrder : Dict String Pending -> Result String ()
+validPreviousOrder items =
+    -- Version 2 positions included completed tasks among the active rows.
+    validateOrder
+        (\owner ->
+            Dict.values items
+                |> List.filter (\item -> not item.deleted && item.fields.owner == owner)
+                |> List.sortBy .position
+        )
+
+
+validateOrder : (Owner -> List Pending) -> Result String ()
+validateOrder ordered =
     let
         valid owner =
             let
                 positions =
-                    orderedPending owner { empty | pending = items } |> List.map .position
+                    ordered owner |> List.map .position
             in
             positions == List.range 0 (List.length positions - 1)
     in
@@ -274,11 +462,21 @@ validPendingOrder items =
         Err "Las posiciones activas de cada responsable deben ser consecutivas, desde 0 y sin duplicados."
 
 
-processDecoder : Decoder Process
-processDecoder =
+processDecoder : RowFormat -> Decoder Process
+processDecoder format =
+    let
+        ( extra, statusDecoder ) =
+            case format of
+                LegacyRows ->
+                    ( [], D.succeed ActiveProcess )
+
+                CurrentRows ->
+                    -- Earlier version 3 exports did not include a process status.
+                    ( [ "status" ], optional "status" processStatus |> D.map (Maybe.withDefault ActiveProcess) )
+    in
     strict
         [ "id", "client", "type", "start_date", "context", "template_version", "states", "closed_override", "closed_reason", "legacy_summary", "version", "created_at", "updated_at" ]
-        []
+        extra
         (D.field "type" processKind
             |> D.andThen
                 (\kind ->
@@ -292,7 +490,8 @@ processDecoder =
                                 (D.field "context" D.string)
                                 |> verified BoardStore.validateProcess
                             )
-                        |> using (D.field "states" (jsonString (D.dict taskDecoder |> verified (validateStates kind))))
+                        |> using statusDecoder
+                        |> using (D.field "states" (jsonString (D.dict (taskDecoder format) |> verified (validateStates kind))))
                         |> using closureDecoder
                         |> using (D.field "legacy_summary" D.string)
                         |> using (D.field "template_version" (exactInt templateVersion))
@@ -301,6 +500,23 @@ processDecoder =
                         |> using (D.field "updated_at" timestampDecoder)
                 )
         )
+
+
+processStatus : Decoder ProcessStatus
+processStatus =
+    D.string
+        |> D.andThen
+            (\status ->
+                case status of
+                    "active" ->
+                        D.succeed ActiveProcess
+
+                    "completed" ->
+                        D.succeed CompletedProcess
+
+                    _ ->
+                        D.fail "Estado de proceso no reconocido."
+            )
 
 
 closureDecoder : Decoder Closure
@@ -319,32 +535,56 @@ closureDecoder =
             )
 
 
-taskDecoder : Decoder TaskState
-taskDecoder =
+taskDecoder : RowFormat -> Decoder TaskState
+taskDecoder format =
+    let
+        ( extra, notesDecoder ) =
+            case format of
+                LegacyRows ->
+                    ( [], D.succeed "" )
+
+                CurrentRows ->
+                    ( [ "notes" ], optional "notes" taskNotes |> D.map (Maybe.withDefault "") )
+    in
     strict [ "status" ]
-        [ "reason", "evidence", "priorStatus" ]
+        ([ "reason", "evidence", "priorStatus" ] ++ extra)
         (D.field "status" D.string
             |> D.andThen
                 (\status ->
                     if status == "not_applicable" then
-                        D.map3
-                            (\previous _ evidence -> TaskState (NotApplicable previous) evidence Reviewed Reviewed)
+                        D.map4
+                            (\previous _ evidence notes -> TaskState (NotApplicable previous) evidence notes Reviewed Reviewed)
                             (D.field "priorStatus" completionDecoder)
                             (optional "reason" D.string)
                             (optional "evidence" D.string)
+                            notesDecoder
 
                     else
                         completionValue status
                             |> D.andThen
                                 (\completion ->
                                     -- Legacy comments are deliberately discarded; reviews begin acknowledged.
-                                    D.map3 (\_ _ evidence -> TaskState (Applicable completion) evidence Reviewed Reviewed)
+                                    D.map4 (\_ _ evidence notes -> TaskState (Applicable completion) evidence notes Reviewed Reviewed)
                                         (optional "reason" D.string)
                                         (optional "priorStatus" completionDecoder)
                                         (optional "evidence" D.string)
+                                        notesDecoder
                                 )
                 )
         )
+
+
+taskNotes : Decoder String
+taskNotes =
+    D.string
+        |> verified
+            (\notes ->
+                if String.length notes <= maxTaskNotes then
+                    Ok ()
+
+                else
+                    Err ("Las notas de un paso no pueden superar " ++ String.fromInt maxTaskNotes ++ " caracteres.")
+            )
 
 
 validateStates : ProcessKind -> Dict String TaskState -> Result String ()
@@ -410,7 +650,7 @@ snapshotPayload =
             |> using (D.field "oldDefaults" checkMap)
             |> using (D.field "effectiveChecks" checkMap)
             |> using (D.field "checks" (rows checkDecoder))
-            |> using (D.field "opportunities" (rows opportunityDecoder))
+            |> using (D.field "opportunities" (rows (opportunityDecoder LegacyRows)))
             |> using (D.field "pending" (rows legacyPending))
         )
 
@@ -692,7 +932,13 @@ ownerDecoder =
                     "Rolando" ->
                         D.succeed Rolando
 
+                    "Rolo" ->
+                        D.succeed Rolando
+
                     "dot" ->
+                        D.succeed Dot
+
+                    "Dot" ->
                         D.succeed Dot
 
                     "Otros" ->
@@ -837,10 +1083,25 @@ encodeOpportunity item =
          , ( "notes", E.string item.fields.notes )
          , ( "source", E.string item.fields.source )
          , ( "proposed", encodeBool item.fields.proposed )
-         , ( "deleted", encodeBool item.deleted )
+         , ( "deleted", encodeBool (opportunityDiscarded item) )
+         , ( "status", E.string (oppStatusName item.status) )
+         , ( "completionSuggested", E.bool (completionSuggested item) )
          ]
             ++ encodeMeta item
         )
+
+
+oppStatusName : OpportunityStatus -> String
+oppStatusName status =
+    case status of
+        ActiveOpportunity _ ->
+            "active"
+
+        DiscardedOpportunity ->
+            "discarded"
+
+        CompletedOpportunity ->
+            "completed"
 
 
 encodePending : Pending -> E.Value
@@ -859,15 +1120,47 @@ encodePending item =
 encodePendingContent : PendingContent -> E.Value
 encodePendingContent content =
     case content of
-        PendingTask title completion ->
+        PendingTask title status ->
             E.object
                 [ ( "type", E.string "task" )
                 , ( "title", E.string title )
-                , ( "done", encodeBool (completion == Done) )
+                , ( "status", encodePendingStatus status )
                 ]
 
         Separator title ->
             E.object [ ( "type", E.string "separator" ), ( "text", E.string title ) ]
+
+
+encodePendingStatus : PendingStatus -> E.Value
+encodePendingStatus status =
+    case status of
+        AwaitingApproval reviewer ->
+            E.object
+                [ ( "type", E.string "awaitingApproval" )
+                , ( "user", E.string (userName reviewer) )
+                ]
+
+        Approved ->
+            E.object [ ( "type", E.string "approved" ) ]
+
+        CompletedBy by review ->
+            E.object
+                [ ( "type", E.string "completed" )
+                , ( "by", E.string (userName by) )
+                , ( "review"
+                  , E.string
+                        (case review of
+                            Reviewed ->
+                                "reviewed"
+
+                            NeedsReview _ ->
+                                "pending"
+                        )
+                  )
+                ]
+
+        LegacyCompleted ->
+            E.object [ ( "type", E.string "legacyCompleted" ) ]
 
 
 encodeProcess : Process -> E.Value
@@ -895,6 +1188,7 @@ encodeProcess item =
            )
          , ( "start_date", E.string item.fields.startDate )
          , ( "context", E.string item.fields.context )
+         , ( "status", E.string (processStatusName item.status) )
          , ( "template_version", E.int item.templateVersion )
          , ( "states", E.string (E.encode 0 (E.dict identity encodeTask item.states)) )
          , ( "closed_override", encodeBool closed )
@@ -903,6 +1197,16 @@ encodeProcess item =
          ]
             ++ encodeMeta item
         )
+
+
+processStatusName : ProcessStatus -> String
+processStatusName status =
+    case status of
+        ActiveProcess ->
+            "active"
+
+        CompletedProcess ->
+            "completed"
 
 
 encodeTask : TaskState -> E.Value
@@ -924,7 +1228,7 @@ encodeTask state =
                 Nothing ->
                     []
     in
-    E.object (fields ++ evidence)
+    E.object (fields ++ evidence ++ [ ( "notes", E.string state.notes ) ])
 
 
 completionName : Completion -> String

@@ -11,10 +11,10 @@ verify username key =
     let
         account =
             case String.toLower (String.trim username) of
-                "usuario1" ->
+                "rolo" ->
                     Just UserOne
 
-                "usuario2" ->
+                "dot" ->
                     Just UserTwo
 
                 _ ->

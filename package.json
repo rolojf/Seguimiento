@@ -4,7 +4,8 @@
   "description": "Seguimiento con Elm, Lamdera y Tailwind CSS.",
   "main": "index.js",
   "scripts": {
-    "start": "run-pty % lamdera live % tailwindcss -i ./src/styles.css -o ./public/styles.css --watch",
+    "start": "run-pty % bash scripts/live.sh % tailwindcss -i ./src/styles.css -o ./public/styles.css --watch",
+    "restore": "bash scripts/restore.sh",
     "build:css": "tailwindcss -i ./src/styles.css -o ./public/styles.css",
     "check": "lamdera check",
     "audit": "npm audit --audit-level=low"

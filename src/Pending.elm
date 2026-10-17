@@ -1,14 +1,17 @@
-module Pending exposing (Model, Msg, init, isLocal, settle, subscriptions, update, view)
+module Pending exposing (Model, Msg, init, isLocal, isReview, isWaiting, settle, subscriptions, update, view)
 
 import Bitwise
+import Browser.Dom
 import Browser.Events
 import Dict
-import Domain exposing (Board, Change(..), Completion(..), Owner(..), PendingContent(..), PendingFields, PendingMove(..), Ref, Review(..), SaveState(..), Target(..), User)
+import Domain exposing (Board, Change(..), Completion(..), CompletionEdit(..), Owner(..), PendingContent(..), PendingFields, PendingMove(..), PendingStatus(..), Ref, Review(..), SaveState(..), Target(..), User)
 import Html exposing (Html)
 import Html.Attributes as A
 import Html.Events as E
 import Html.Keyed as Keyed
 import Json.Decode as Decode
+import Process
+import Task
 
 
 type alias Model =
@@ -16,6 +19,7 @@ type alias Model =
     , filter : ItemFilter
     , submitting : Submission
     , error : Maybe String
+    , nextReview : Int
     }
 
 
@@ -23,10 +27,16 @@ type Ui
     = Browsing
     | Editing Draft
     | Dragging Drag
+    | Reviewing ReviewWait
+
+
+type alias ReviewWait =
+    { ref : Ref, token : Int, deadline : Float }
 
 
 type ItemFilter
     = ActiveItems
+    | CompletedItems
     | DiscardedItems
 
 
@@ -38,6 +48,7 @@ type Submission
 
 type RecordState
     = Active
+    | Finished
     | Discarded
 
 
@@ -47,7 +58,7 @@ type DraftTarget
 
 
 type DraftContent
-    = TaskDraft String Completion
+    = TaskDraft String PendingStatus
     | BlankDraft
     | SeparatorDraft String
 
@@ -58,6 +69,7 @@ type alias Draft =
     , owner : Owner
     , shift : String
     , orderRevision : Int
+    , completion : CompletionEdit
     }
 
 
@@ -82,6 +94,7 @@ type Msg
     | KindChanged String
     | OwnerChanged String
     | ShiftChanged String
+    | CompletionChanged String
     | Save
     | Retry
     | Refresh
@@ -89,9 +102,13 @@ type Msg
     | DiscardEdit
     | RestoreEdit
     | PurgeEdit
-    | Toggle Ref Completion
+    | Toggle Ref
+    | ReviewClick Ref Float
+    | ReviewElapsed ReviewWait
     | Confirm Ref
     | DiscardRow Ref
+    | PurgeLast Owner Ref
+    | DeleteSeparator Ref
     | Filter ItemFilter
     | BeginDrag Drag
     | HoverRow Owner String
@@ -99,11 +116,40 @@ type Msg
     | LeaveGroup Owner
     | ReleaseDrag
     | CancelDrag
+    | FocusedInput
 
 
 init : Model
 init =
-    { ui = Browsing, filter = ActiveItems, submitting = Idle, error = Nothing }
+    { ui = Browsing, filter = ActiveItems, submitting = Idle, error = Nothing, nextReview = 0 }
+
+
+reviewDelay : Float
+reviewDelay =
+    3000
+
+
+isWaiting : Model -> Bool
+isWaiting model =
+    case model.ui of
+        Reviewing _ ->
+            True
+
+        _ ->
+            False
+
+
+isReview : Msg -> Bool
+isReview msg =
+    case msg of
+        ReviewClick _ _ ->
+            True
+
+        ReviewElapsed _ ->
+            True
+
+        _ ->
+            False
 
 
 primaryButton : Int
@@ -146,16 +192,99 @@ isLocal msg =
         CancelDrag ->
             True
 
+        FocusedInput ->
+            True
+
         _ ->
             False
 
 
-update : Msg -> Board -> Model -> ( Model, Maybe Change )
-update msg board model =
+update : User -> Msg -> Board -> Model -> ( Model, Cmd Msg, Maybe Change )
+update user msg board model =
     case ( msg, model.ui ) of
         ( AddTask, Browsing ) ->
-            newDraft (TaskDraft "" Todo) board model
+            let
+                ( updated, change ) =
+                    newDraft (TaskDraft "" Approved) board model
+            in
+            ( updated, Browser.Dom.focus "pending-content" |> Task.attempt (\_ -> FocusedInput), change )
 
+        ( ReviewClick reference clickedAt, Browsing ) ->
+            if canReview user reference board then
+                let
+                    waiting =
+                        { ref = reference, token = model.nextReview, deadline = clickedAt + reviewDelay }
+                in
+                ( { model
+                    | ui = Reviewing waiting
+                    , nextReview = model.nextReview + 1
+                    , error = Nothing
+                  }
+                , Process.sleep reviewDelay |> Task.perform (\_ -> ReviewElapsed waiting)
+                , Nothing
+                )
+
+            else
+                ( model, Cmd.none, Nothing )
+
+        ( ReviewClick reference clickedAt, Reviewing waiting ) ->
+            if reference == waiting.ref then
+                finishReview user
+                    board
+                    waiting
+                    (if clickedAt < waiting.deadline then
+                        RejectPendingCompletion reference
+
+                     else
+                        TogglePending reference
+                    )
+                    model
+
+            else
+                ( model, Cmd.none, Nothing )
+
+        ( ReviewElapsed elapsed, Reviewing waiting ) ->
+            -- Include the click deadline so stale timers cannot survive a new login.
+            if elapsed == waiting then
+                finishReview user board waiting (TogglePending waiting.ref) model
+
+            else
+                ( model, Cmd.none, Nothing )
+
+        _ ->
+            let
+                ( updated, change ) =
+                    updateReady msg board model
+            in
+            ( updated, Cmd.none, change )
+
+
+canReview : User -> Ref -> Board -> Bool
+canReview user reference board =
+    Dict.get reference.id board.pending
+        |> Maybe.map
+            (\item ->
+                Domain.ref item
+                    == reference
+                    && not item.deleted
+                    && Domain.pendingReview item.fields.content
+                    == NeedsReview user
+            )
+        |> Maybe.withDefault False
+
+
+finishReview : User -> Board -> ReviewWait -> Change -> Model -> ( Model, Cmd Msg, Maybe Change )
+finishReview user board waiting change model =
+    if canReview user waiting.ref board then
+        ( { model | ui = Browsing, error = Nothing }, Cmd.none, Just change )
+
+    else
+        ( { model | ui = Browsing, error = Just "El pendiente cambió durante la espera. Revisa su estado actual." }, Cmd.none, Nothing )
+
+
+updateReady : Msg -> Board -> Model -> ( Model, Maybe Change )
+updateReady msg board model =
+    case ( msg, model.ui ) of
         ( AddSeparator, Browsing ) ->
             newDraft BlankDraft board model
 
@@ -177,13 +306,16 @@ update msg board model =
             editDraft { draft | content = changeContent content draft.content } model
 
         ( KindChanged kind, Editing draft ) ->
-            editDraft { draft | content = changeKind kind draft.content } model
+            editDraft { draft | content = changeKind kind draft.content, completion = KeepCompletion } model
 
         ( OwnerChanged owner, Editing draft ) ->
             editDraft { draft | owner = parseOwner owner } model
 
         ( ShiftChanged shift, Editing draft ) ->
             editDraft { draft | shift = shift } model
+
+        ( CompletionChanged value, Editing draft ) ->
+            editDraft { draft | completion = selectedCompletion value draft, shift = "0" } model
 
         ( Save, Editing draft ) ->
             saveDraft draft model
@@ -211,14 +343,20 @@ update msg board model =
         ( PurgeEdit, Editing draft ) ->
             editorAction Discarded PurgePending draft model
 
-        ( Toggle reference completion, Browsing ) ->
-            ( model, Just (CompletePending reference completion) )
+        ( Toggle reference, Browsing ) ->
+            ( model, Just (TogglePending reference) )
 
         ( Confirm reference, Browsing ) ->
             ( model, Just (ConfirmPending reference) )
 
         ( DiscardRow reference, Browsing ) ->
             ( model, Just (RemovePending reference) )
+
+        ( PurgeLast owner reference, Browsing ) ->
+            ( model, Just (PurgeCompleted owner reference) )
+
+        ( DeleteSeparator reference, Browsing ) ->
+            ( model, Just (PurgeSeparator reference) )
 
         ( Filter itemFilter, Browsing ) ->
             ( { model | filter = itemFilter, error = Nothing }, Nothing )
@@ -273,7 +411,7 @@ update msg board model =
 newDraft : DraftContent -> Board -> Model -> ( Model, Maybe Change )
 newDraft content board model =
     ( { model
-        | ui = Editing { target = Adding, content = content, owner = Rolando, shift = "0", orderRevision = board.pendingOrderRevision }
+        | ui = Editing { target = Adding, content = content, owner = Rolando, shift = "0", orderRevision = board.pendingOrderRevision, completion = KeepCompletion }
         , filter = ActiveItems
         , error = Nothing
         , submitting = Idle
@@ -285,17 +423,11 @@ newDraft content board model =
 draftFrom : Board -> Domain.Pending -> Draft
 draftFrom board item =
     { target =
-        Saved (Domain.ref item)
-            (if item.deleted then
-                Discarded
-
-             else
-                Active
-            )
+        Saved (Domain.ref item) (recordState item)
     , content =
         case item.fields.content of
-            PendingTask title completion ->
-                TaskDraft title completion
+            PendingTask title status ->
+                TaskDraft title status
 
             Separator "" ->
                 BlankDraft
@@ -305,12 +437,13 @@ draftFrom board item =
     , owner = item.fields.owner
     , shift = "0"
     , orderRevision = board.pendingOrderRevision
+    , completion = KeepCompletion
     }
 
 
 editDraft : Draft -> Model -> ( Model, Maybe Change )
 editDraft draft model =
-    if isDiscarded draft then
+    if isReadOnly draft then
         ( model, Nothing )
 
     else
@@ -320,8 +453,8 @@ editDraft draft model =
 changeContent : String -> DraftContent -> DraftContent
 changeContent content current =
     case current of
-        TaskDraft _ completion ->
-            TaskDraft content completion
+        TaskDraft _ status ->
+            TaskDraft content status
 
         BlankDraft ->
             BlankDraft
@@ -344,7 +477,7 @@ changeKind kind current =
                 SeparatorDraft "- - -"
 
             _ ->
-                TaskDraft "" Todo
+                TaskDraft "" Approved
 
 
 contentKind : DraftContent -> String
@@ -362,7 +495,7 @@ contentKind content =
 
 saveDraft : Draft -> Model -> ( Model, Maybe Change )
 saveDraft draft model =
-    if isDiscarded draft then
+    if isReadOnly draft then
         failure "Restaura este pendiente antes de modificarlo." model
 
     else
@@ -387,7 +520,7 @@ saveDraft draft model =
 
                 else
                     ( { model | ui = Editing draft, submitting = SaveChange }
-                    , Just (SavePending (domainTarget draft.target) fields move)
+                    , Just (SavePending (domainTarget draft.target) fields move draft.completion)
                     )
 
 
@@ -398,8 +531,11 @@ retryDraft board draft model =
             failure error model
 
         Ok refreshed ->
-            if isDiscarded refreshed then
-                failure "El pendiente fue descartado. Restaura para modificarlo." { model | ui = Editing refreshed }
+            if refreshed.owner /= draft.owner then
+                failure "La tarea se completó en otra sesión. Conservamos tu texto y recuperamos su responsable actual; guarda Pendiente antes de cambiarlo." { model | ui = Editing refreshed }
+
+            else if isReadOnly refreshed then
+                failure "El pendiente fue descartado. Restaura antes de modificarlo." { model | ui = Editing refreshed }
 
             else
                 saveDraft refreshed model
@@ -420,18 +556,18 @@ refreshDraft board draft =
                     Ok
                         { draft
                             | target =
-                                Saved (Domain.ref current)
-                                    (if current.deleted then
-                                        Discarded
-
-                                     else
-                                        Active
-                                    )
+                                Saved (Domain.ref current) (recordState current)
                             , orderRevision = board.pendingOrderRevision
+                            , owner =
+                                if Domain.pendingCompletion current.fields.content == Just Done then
+                                    current.fields.owner
+
+                                else
+                                    draft.owner
                             , content =
                                 case ( draft.content, current.fields.content ) of
-                                    ( TaskDraft title _, PendingTask _ completion ) ->
-                                        TaskDraft title completion
+                                    ( TaskDraft title _, PendingTask _ status ) ->
+                                        TaskDraft title status
 
                                     _ ->
                                         draft.content
@@ -466,8 +602,8 @@ draftFields : Draft -> PendingFields
 draftFields draft =
     { content =
         case draft.content of
-            TaskDraft title completion ->
-                PendingTask title completion
+            TaskDraft title status ->
+                PendingTask title status
 
             BlankDraft ->
                 Separator ""
@@ -478,8 +614,44 @@ draftFields draft =
     }
 
 
-isDiscarded : Draft -> Bool
-isDiscarded draft =
+draftCompletion : Draft -> Completion
+draftCompletion draft =
+    case draft.completion of
+        KeepCompletion ->
+            Domain.pendingCompletion (draftFields draft).content |> Maybe.withDefault Todo
+
+        ChangeCompletion completion ->
+            completion
+
+
+selectedCompletion : String -> Draft -> CompletionEdit
+selectedCompletion value draft =
+    let
+        selection =
+            case value of
+                "pending" ->
+                    Just Todo
+
+                "completed" ->
+                    Just Done
+
+                _ ->
+                    Nothing
+    in
+    case selection of
+        Just completion ->
+            if Domain.pendingCompletion (draftFields draft).content == Just completion then
+                KeepCompletion
+
+            else
+                ChangeCompletion completion
+
+        Nothing ->
+            draft.completion
+
+
+isReadOnly : Draft -> Bool
+isReadOnly draft =
     case draft.target of
         Saved _ Discarded ->
             True
@@ -488,10 +660,22 @@ isDiscarded draft =
             False
 
 
+recordState : Domain.Pending -> RecordState
+recordState item =
+    if item.deleted then
+        Discarded
+
+    else if Domain.pendingIsComplete item.fields.content then
+        Finished
+
+    else
+        Active
+
+
 parseOwner : String -> Owner
 parseOwner owner =
     case owner of
-        "dot" ->
+        "Dot" ->
             Dot
 
         "Otros" ->
@@ -601,6 +785,9 @@ view state user board model =
         count =
             List.filter (\item -> not item.deleted && Domain.pendingCompletion item.fields.content == Just Todo) items |> List.length
 
+        completedCount =
+            List.filter (\item -> not item.deleted && Domain.pendingIsComplete item.fields.content) items |> List.length
+
         locked =
             if model.ui == Browsing then
                 state
@@ -615,11 +802,15 @@ view state user board model =
                 [ Html.h2 [ A.class "text-xl font-semibold text-slate-900" ] [ Html.text "Pendientes" ]
                 , Html.p [ A.class "text-base text-slate-500" ]
                     [ Html.text
-                        (if model.filter == ActiveItems then
-                            String.fromInt count ++ " por resolver"
+                        (case model.filter of
+                            ActiveItems ->
+                                String.fromInt count ++ " por resolver"
 
-                         else
-                            String.fromInt (List.length discarded) ++ " descartados · más recientes primero"
+                            CompletedItems ->
+                                String.fromInt completedCount ++ " completados · más recientes primero"
+
+                            DiscardedItems ->
+                                String.fromInt (List.length discarded) ++ " descartados · más recientes primero"
                         )
                     ]
                 ]
@@ -643,12 +834,20 @@ view state user board model =
                     , button Ready CancelDrag "Cancelar arrastre"
                     ]
 
+            Reviewing _ ->
+                Html.span [ A.class "sr-only", A.attribute "role" "status" ]
+                    [ Html.text "Esperando tres segundos. Otro clic deja la tarea pendiente; sin otro clic pasa a Completados." ]
+
             Browsing ->
                 Html.text ""
         , case model.filter of
             ActiveItems ->
                 Html.div [ A.class "grid gap-5 lg:grid-cols-3" ]
-                    (List.map (groupView locked user board model) [ Rolando, Dot, Others ])
+                    (List.map (groupView state user board model) [ Rolando, Dot, Others ])
+
+            CompletedItems ->
+                Html.div [ A.class "grid gap-5 lg:grid-cols-3" ]
+                    (List.map (completedGroup locked user board) [ Rolando, Dot, Others ])
 
             DiscardedItems ->
                 if List.isEmpty discarded then
@@ -685,7 +884,7 @@ filterView state current =
                     ]
                     [ Html.text title ]
             )
-            [ ( ActiveItems, "Activos" ), ( DiscardedItems, "Descartados" ) ]
+            [ ( ActiveItems, "Activos" ), ( CompletedItems, "Completados" ), ( DiscardedItems, "Descartados" ) ]
         )
 
 
@@ -710,63 +909,155 @@ groupView state user board model owner =
         ]
 
 
+completedGroup : SaveState -> User -> Board -> Owner -> Html Msg
+completedGroup state user board owner =
+    let
+        items =
+            Domain.completedPending owner board
+    in
+    Html.div [ A.class "min-w-0 rounded-lg bg-slate-50 p-4" ]
+        [ Html.div [ A.class "mb-3 flex items-center gap-2" ]
+            [ Html.h3 [ A.class "font-semibold text-slate-700" ] [ Html.text (Domain.ownerLabel owner) ]
+            , case List.reverse items |> List.head of
+                Just oldest ->
+                    reviewButton state
+                        (PurgeLast owner (Domain.ref oldest))
+                        ("Borrar definitivamente el completado más antiguo de " ++ Domain.ownerLabel owner ++ ": " ++ itemLabel oldest)
+                        "✕"
+
+                Nothing ->
+                    Html.text ""
+            ]
+        , if List.isEmpty items then
+            Html.p [ A.class "text-base text-slate-500" ] [ Html.text "Sin completados" ]
+
+          else
+            Keyed.node "ul"
+                [ A.class "space-y-3" ]
+                (List.map
+                    (\item ->
+                        ( item.id
+                        , Html.li [ A.class "space-y-1" ]
+                            [ Html.div [ A.class "flex items-start gap-2" ]
+                                [ Html.div [ A.class "min-w-0 flex-1" ] [ contentView state user Browsing item ]
+                                , editButton state item
+                                ]
+                            , Html.time [ A.datetime item.updatedAt, A.class "block text-[0.625rem] leading-tight text-slate-600" ]
+                                [ Html.text ((String.left 19 item.updatedAt |> String.replace "T" " ") ++ " UTC") ]
+                            ]
+                        )
+                    )
+                    items
+                )
+        ]
+
+
 activeRow : SaveState -> User -> Int -> List String -> Ui -> Domain.Pending -> Html Msg
 activeRow state user revision ids ui item =
+    let
+        locked =
+            if ui == Browsing then
+                state
+
+            else
+                Saving
+
+        checkboxState =
+            case ui of
+                Reviewing waiting ->
+                    if waiting.ref == Domain.ref item then
+                        state
+
+                    else
+                        locked
+
+                _ ->
+                    locked
+    in
     Html.li
         [ A.class ("rounded px-1 py-2 " ++ dragClass ui item.id)
         , E.onMouseEnter (HoverRow item.fields.owner item.id)
         , E.onMouseLeave (LeaveRow item.fields.owner item.id)
         ]
         [ Html.div [ A.class "flex items-start gap-2" ]
-            [ dragHandle state revision ids item
+            [ dragHandle locked revision ids item
             , Html.div [ A.class "min-w-0 flex-1 space-y-2" ]
-                [ contentView state item
-                , if item.review == NeedsReview user then
+                [ contentView checkboxState user ui item
+                , if Domain.pendingApproval item.fields.content == Just user then
                     Html.div [ A.class "flex flex-wrap items-center gap-2" ]
                         [ Html.span [ A.class "font-bold text-amber-700", A.attribute "role" "img", A.attribute "aria-label" "Elemento nuevo por revisar" ] [ Html.text "!" ]
-                        , button state (Confirm (Domain.ref item)) "Confirmar"
-                        , button state (DiscardRow (Domain.ref item)) "Descartar"
+                        , reviewButton locked (Confirm (Domain.ref item)) "Confirmar pendiente" "✓"
+                        , reviewButton locked (DiscardRow (Domain.ref item)) "Descartar pendiente" "✕"
                         ]
 
                   else
                     Html.text ""
                 ]
-            , Html.button
-                [ A.type_ "button"
-                , E.onClick (Edit item.id)
-                , A.disabled (state == Saving)
-                , A.class "shrink-0 rounded border border-slate-300 bg-white px-2 py-1 text-base font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                , A.attribute "aria-label" ("Editar " ++ itemLabel item)
-                ]
-                [ Html.text "Editar" ]
+            , itemActions locked item
             ]
         ]
 
 
-contentView : SaveState -> Domain.Pending -> Html Msg
-contentView state item =
+contentView : SaveState -> User -> Ui -> Domain.Pending -> Html Msg
+contentView state user ui item =
     case item.fields.content of
-        PendingTask title completion ->
-            Html.label [ A.class "flex min-w-0 items-start gap-2 text-base" ]
-                [ Html.input
-                    [ A.type_ "checkbox"
-                    , A.checked (completion == Done)
-                    , A.disabled (state == Saving)
-                    , A.class "mt-1 h-4 w-4 shrink-0"
-                    , E.onCheck
-                        (\done ->
-                            Toggle (Domain.ref item)
-                                (if done then
-                                    Done
+        PendingTask title _ ->
+            let
+                reviewNeeded =
+                    Domain.pendingReview item.fields.content == NeedsReview user
 
-                                 else
-                                    Todo
-                                )
-                        )
+                complete =
+                    Domain.pendingCompletion item.fields.content == Just Done
+
+                interaction =
+                    if reviewNeeded then
+                        E.preventDefaultOn "click"
+                            (Decode.field "timeStamp" Decode.float
+                                |> Decode.map (\time -> ( ReviewClick (Domain.ref item) time, True ))
+                            )
+
+                    else
+                        E.onCheck (\_ -> Toggle (Domain.ref item))
+
+                description =
+                    if reviewNeeded then
+                        title ++ ". Completado por el otro usuario. Un clic espera tres segundos y confirma; otro clic dentro de esos tres segundos lo deja pendiente."
+
+                    else if Domain.pendingIsComplete item.fields.content then
+                        title ++ ". Desmarca para reabrir este pendiente."
+
+                    else
+                        title
+            in
+            Html.label [ A.class "flex min-w-0 items-start gap-2 text-base" ]
+                [ Html.span [ A.class "mt-1 inline-flex shrink-0 items-center gap-0.5" ]
+                    [ Html.input
+                        [ A.type_ "checkbox"
+                        , A.checked complete
+                        , A.disabled (state == Saving || Domain.pendingApproval item.fields.content /= Nothing)
+                        , A.classList
+                            [ ( "h-4 w-4 shrink-0", True )
+                            , ( "ring-2 ring-amber-500 ring-offset-1"
+                              , case ui of
+                                    Reviewing waiting ->
+                                        waiting.ref == Domain.ref item
+
+                                    _ ->
+                                        False
+                              )
+                            ]
+                        , A.attribute "aria-label" description
+                        , interaction
+                        ]
+                        []
+                    , if reviewNeeded then
+                        Html.span [ A.class "text-base font-bold leading-none text-amber-700", A.attribute "aria-hidden" "true" ] [ Html.text "!" ]
+
+                      else
+                        Html.text ""
                     ]
-                    []
                 , Html.span
-                    [ A.classList [ ( "min-w-0 break-words", True ), ( "text-slate-400 line-through", completion == Done ) ]
+                    [ A.classList [ ( "min-w-0 break-words", True ), ( "text-slate-400 line-through", complete ) ]
                     , A.style "overflow-wrap" "anywhere"
                     ]
                     [ Html.text title ]
@@ -787,6 +1078,16 @@ contentView state item =
                 [ Html.text content ]
 
 
+itemActions : SaveState -> Domain.Pending -> Html Msg
+itemActions state item =
+    case item.fields.content of
+        Separator _ ->
+            reviewButton state (DeleteSeparator (Domain.ref item)) ("Borrar definitivamente " ++ itemLabel item) "✕"
+
+        PendingTask _ _ ->
+            editButton state item
+
+
 dragHandle : SaveState -> Int -> List String -> Domain.Pending -> Html Msg
 dragHandle state revision ids item =
     let
@@ -797,7 +1098,17 @@ dragHandle state revision ids item =
         [ A.type_ "button"
         , A.disabled (state == Saving)
         , A.class "shrink-0 cursor-grab rounded px-1 text-base text-slate-500 active:cursor-grabbing"
-        , A.attribute "aria-label" ("Arrastrar " ++ itemLabel item ++ ". También puedes cambiar su posición desde Editar.")
+        , A.attribute "aria-label"
+            ("Arrastrar "
+                ++ itemLabel item
+                ++ (case item.fields.content of
+                        PendingTask _ _ ->
+                            ". También puedes cambiar su posición desde Editar."
+
+                        Separator _ ->
+                            ""
+                   )
+            )
         , E.preventDefaultOn "mousedown" (Decode.map (\msg -> ( msg, True )) (mouseButton (BeginDrag drag)))
         ]
         [ Html.text "↕" ]
@@ -835,7 +1146,7 @@ discardedRow state item =
         , Html.p [ A.class "text-sm text-slate-600" ] [ Html.text (Domain.ownerLabel item.fields.owner ++ " · Descartado") ]
         , Html.time [ A.datetime item.updatedAt, A.class "block text-sm text-slate-600" ]
             [ Html.text ((String.left 19 item.updatedAt |> String.replace "T" " ") ++ " UTC") ]
-        , button state (Edit item.id) "Editar"
+        , itemActions state item
         ]
 
 
@@ -856,11 +1167,14 @@ editorView : SaveState -> Maybe String -> Submission -> Draft -> Html Msg
 editorView state error submission draft =
     let
         fieldState =
-            if isDiscarded draft then
+            if isReadOnly draft then
                 Saving
 
             else
                 state
+
+        wasDone =
+            Domain.pendingCompletion (draftFields draft).content == Just Done
     in
     Html.form [ E.onSubmit Save, A.class "mb-6 space-y-4 rounded-lg border border-slate-200 p-4" ]
         [ Html.h3 [ A.class "text-lg font-semibold" ]
@@ -870,21 +1184,6 @@ editorView state error submission draft =
 
                  else
                     "Editar elemento"
-                )
-            ]
-        , Html.div [ A.class "grid gap-4 sm:grid-cols-2" ]
-            [ field "pending-kind"
-                "Tipo"
-                (Html.select [ A.id "pending-kind", A.class inputClass, A.value (contentKind draft.content), A.disabled (fieldState == Saving), E.onInput KindChanged ]
-                    [ Html.option [ A.value "task" ] [ Html.text "Pendiente" ]
-                    , Html.option [ A.value "blank" ] [ Html.text "Separador vacío" ]
-                    , Html.option [ A.value "separator" ] [ Html.text "Separador con texto" ]
-                    ]
-                )
-            , field "pending-owner"
-                "Responsable"
-                (Html.select [ A.id "pending-owner", A.class inputClass, A.value (Domain.ownerLabel draft.owner), A.disabled (fieldState == Saving), E.onInput OwnerChanged ]
-                    (List.map (\owner -> Html.option [ A.value (Domain.ownerLabel owner) ] [ Html.text (Domain.ownerLabel owner) ]) [ Rolando, Dot, Others ])
                 )
             ]
         , case draft.content of
@@ -900,8 +1199,78 @@ editorView state error submission draft =
                 field "pending-content"
                     "Texto del separador"
                     (Html.input [ A.id "pending-content", A.class inputClass, A.value content, A.placeholder "- - -", A.maxlength 90, A.disabled (fieldState == Saving), E.onInput ContentChanged ] [])
-        , if isDiscarded draft then
-            Html.p [ A.class "text-base text-slate-600" ] [ Html.text "Restaura para modificar este pendiente. Borrar definitivamente lo elimina del tablero y de sus próximos respaldos." ]
+        , field "pending-owner"
+            "Responsable"
+            (Html.select [ A.id "pending-owner", A.class inputClass, A.value (Domain.ownerLabel draft.owner), A.disabled (fieldState == Saving || wasDone), E.onInput OwnerChanged ]
+                (List.map (\owner -> Html.option [ A.value (Domain.ownerLabel owner) ] [ Html.text (Domain.ownerLabel owner) ]) [ Rolando, Dot, Others ])
+            )
+        , completionField fieldState draft
+        , if draft.target == Adding then
+            Html.text ""
+
+          else
+            editorOptions fieldState draft
+        , if wasDone && not (isReadOnly draft) then
+            Html.p [ A.class "text-sm text-slate-600" ]
+                [ Html.text "Para cambiar el responsable o el tipo, primero guarda el estado Pendiente." ]
+
+          else
+            Html.text ""
+        , if isReadOnly draft then
+            Html.p [ A.class "text-base text-slate-600" ]
+                [ Html.text "Restaura para modificar este pendiente. Borrar definitivamente lo elimina del tablero y de sus próximos respaldos." ]
+
+          else
+            Html.text ""
+        , Html.div [ A.class "flex flex-wrap gap-2" ]
+            (editorButtons state draft
+                ++ [ button state Cancel "Cerrar" ]
+            )
+        , if draft.target == Adding then
+            -- Keep the quick entry path in natural DOM order: text, owner, save.
+            Html.details [ A.class "space-y-4" ]
+                [ Html.summary [ A.class "cursor-pointer text-sm font-medium" ] [ Html.text "Más opciones: tipo y posición" ]
+                , editorOptions fieldState draft
+                ]
+
+          else
+            Html.text ""
+        , if error /= Nothing && (isReadOnly draft || submission == StatusChange) then
+            Html.div [ A.class "space-y-2 text-sm text-slate-600" ]
+                [ Html.p [] [ Html.text "Actualiza la versión antes de volver a descartar, restaurar o borrar. Este botón no modifica el registro." ]
+                , button state Refresh "Actualizar versión"
+                ]
+
+          else if error /= Nothing then
+            Html.div [ A.class "space-y-2 text-sm text-slate-600" ]
+                [ Html.p [] [ Html.text "Tu texto, estado elegido y movimiento siguen aquí. Revisa la lista antes de aplicarlos sobre la versión actual." ]
+                , button state Retry "Aplicar sobre versión actual"
+                ]
+
+          else
+            Html.text ""
+        ]
+
+
+editorOptions : SaveState -> Draft -> Html Msg
+editorOptions state draft =
+    Html.div [ A.class "space-y-4" ]
+        [ field "pending-kind"
+            "Tipo"
+            (Html.select
+                [ A.id "pending-kind"
+                , A.class inputClass
+                , A.value (contentKind draft.content)
+                , A.disabled (state == Saving || Domain.pendingCompletion (draftFields draft).content == Just Done)
+                , E.onInput KindChanged
+                ]
+                [ Html.option [ A.value "task" ] [ Html.text "Pendiente" ]
+                , Html.option [ A.value "blank" ] [ Html.text "Separador vacío" ]
+                , Html.option [ A.value "separator" ] [ Html.text "Separador con texto" ]
+                ]
+            )
+        , if isReadOnly draft || draftCompletion draft == Done then
+            Html.text ""
 
           else
             Html.div [ A.class "space-y-1" ]
@@ -922,24 +1291,6 @@ editorView state error submission draft =
                     )
                 , Html.p [ A.id "pending-shift-hint", A.class "text-sm text-slate-600" ] [ Html.text "Positivo sube; negativo baja; 0 conserva la posición. El movimiento se guarda junto con los campos dentro del responsable elegido." ]
                 ]
-        , Html.div [ A.class "flex flex-wrap gap-2" ]
-            (editorButtons state draft
-                ++ [ button state Cancel "Cerrar" ]
-            )
-        , if error /= Nothing && (isDiscarded draft || submission == StatusChange) then
-            Html.div [ A.class "space-y-2 text-sm text-slate-600" ]
-                [ Html.p [] [ Html.text "Actualiza la versión antes de volver a descartar, restaurar o borrar. Este botón no modifica el registro." ]
-                , button state Refresh "Actualizar versión"
-                ]
-
-          else if error /= Nothing then
-            Html.div [ A.class "space-y-2 text-sm text-slate-600" ]
-                [ Html.p [] [ Html.text "Tu texto y movimiento siguen aquí. Revisa la lista antes de aplicar ambos sobre la versión actual." ]
-                , button state Retry "Aplicar sobre versión actual"
-                ]
-
-          else
-            Html.text ""
         ]
 
 
@@ -963,6 +1314,50 @@ editorButtons state draft =
                    )
 
 
+completionField : SaveState -> Draft -> Html Msg
+completionField state draft =
+    case ( draft.target, draft.content ) of
+        ( Saved _ _, TaskDraft _ status ) ->
+            let
+                needsApproval =
+                    case status of
+                        AwaitingApproval _ ->
+                            True
+
+                        _ ->
+                            False
+            in
+            Html.div [ A.class "space-y-1" ]
+                [ field "pending-completion"
+                    "Estado"
+                    (Html.select
+                        [ A.id "pending-completion"
+                        , A.class inputClass
+                        , A.value
+                            (if draftCompletion draft == Done then
+                                "completed"
+
+                             else
+                                "pending"
+                            )
+                        , A.disabled (state == Saving)
+                        , E.onInput CompletionChanged
+                        ]
+                        [ Html.option [ A.value "pending" ] [ Html.text "Pendiente" ]
+                        , Html.option [ A.value "completed", A.disabled needsApproval ] [ Html.text "Completado" ]
+                        ]
+                    )
+                , if needsApproval then
+                    Html.p [ A.class "text-sm text-slate-600" ] [ Html.text "Primero debe aprobarse la tarea para marcarla como completada." ]
+
+                  else
+                    Html.text ""
+                ]
+
+        _ ->
+            Html.text ""
+
+
 field : String -> String -> Html Msg -> Html Msg
 field controlId title control =
     Html.div [ A.class "min-w-0 space-y-1" ]
@@ -971,9 +1366,54 @@ field controlId title control =
         ]
 
 
+
+-- Compact controls keep their full action names for keyboard and screen-reader users.
+
+
+reviewButton : SaveState -> Msg -> String -> String -> Html Msg
+reviewButton state msg title symbol =
+    Html.button
+        [ A.type_ "button"
+        , E.onClick msg
+        , A.disabled (state == Saving)
+        , A.title title
+        , A.attribute "aria-label" title
+        , A.class "inline-flex h-7 w-7 items-center justify-center rounded border border-slate-300 bg-white text-base font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        ]
+        [ Html.span [ A.attribute "aria-hidden" "true" ] [ Html.text symbol ] ]
+
+
+editButton : SaveState -> Domain.Pending -> Html Msg
+editButton state item =
+    Html.button
+        [ A.type_ "button"
+        , E.onClick (Edit item.id)
+        , A.disabled (state == Saving)
+        , A.class "shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[0.75rem] leading-5 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        , A.attribute "aria-label" ("Editar " ++ itemLabel item)
+        ]
+        [ Html.text "Editar" ]
+
+
 button : SaveState -> Msg -> String -> Html Msg
 button state msg title =
-    Html.button [ A.type_ "button", E.onClick msg, A.disabled (state == Saving), A.class "rounded border border-slate-300 px-3 py-2 text-base font-medium hover:bg-slate-50 disabled:opacity-50" ] [ Html.text title ]
+    Html.button
+        ([ A.type_ "button", E.onClick msg, A.disabled (state == Saving), A.class "rounded border border-slate-300 px-3 py-2 text-base font-medium hover:bg-slate-50 disabled:opacity-50" ]
+            ++ (case msg of
+                    AddTask ->
+                        [ A.id "pending-add", A.title "Añadir pendiente (Ctrl+A)", A.attribute "aria-keyshortcuts" "Control+A" ]
+
+                    _ ->
+                        []
+               )
+        )
+        (case msg of
+            AddTask ->
+                [ Html.u [] [ Html.text "A" ], Html.text "ñadir pendiente" ]
+
+            _ ->
+                [ Html.text title ]
+        )
 
 
 inputClass : String

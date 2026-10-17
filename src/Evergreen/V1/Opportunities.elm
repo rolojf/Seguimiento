@@ -6,19 +6,28 @@ import Evergreen.V1.Domain
 
 type ViewStatus
     = ActiveOnly
+    | CompletedOnly
     | DiscardedOnly
+
+
+type Action
+    = Complete
+    | PermanentlyDelete
 
 
 type Panel
     = Closed
     | Detail String
     | Editor Evergreen.V1.Domain.Target Evergreen.V1.Domain.OpportunityFields
+    | Confirmation Action Evergreen.V1.Domain.Ref
 
 
 type Intent
     = SaveForm Evergreen.V1.Domain.Target
     | DeleteItem String
     | RestoreItem String
+    | CompleteItem String
+    | PurgeItem String
     | ChangeItem
 
 
@@ -111,6 +120,12 @@ type Msg
     | Confirm Evergreen.V1.Domain.Ref
     | Discard Evergreen.V1.Domain.Ref
     | Restore Evergreen.V1.Domain.Ref
+    | Suggest Evergreen.V1.Domain.Ref Evergreen.V1.Domain.CompletionProposal
+    | AskComplete Evergreen.V1.Domain.Ref
+    | AskPurge Evergreen.V1.Domain.Ref
+    | ConfirmAction
+    | CancelAction
+    | Ignore
     | DismissUndo
     | StartDrag String Int Point
     | GotBounds Int (Result Browser.Dom.Error Browser.Dom.Element)

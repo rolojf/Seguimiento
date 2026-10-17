@@ -5,6 +5,7 @@ import Evergreen.V1.Domain
 
 type RecordState
     = Active
+    | Finished
     | Discarded
 
 
@@ -14,7 +15,7 @@ type DraftTarget
 
 
 type DraftContent
-    = TaskDraft String Evergreen.V1.Domain.Completion
+    = TaskDraft String Evergreen.V1.Domain.PendingStatus
     | BlankDraft
     | SeparatorDraft String
 
@@ -25,6 +26,7 @@ type alias Draft =
     , owner : Evergreen.V1.Domain.Owner
     , shift : String
     , orderRevision : Int
+    , completion : Evergreen.V1.Domain.CompletionEdit
     }
 
 
@@ -37,14 +39,23 @@ type alias Drag =
     }
 
 
+type alias ReviewWait =
+    { ref : Evergreen.V1.Domain.Ref
+    , token : Int
+    , deadline : Float
+    }
+
+
 type Ui
     = Browsing
     | Editing Draft
     | Dragging Drag
+    | Reviewing ReviewWait
 
 
 type ItemFilter
     = ActiveItems
+    | CompletedItems
     | DiscardedItems
 
 
@@ -59,6 +70,7 @@ type alias Model =
     , filter : ItemFilter
     , submitting : Submission
     , error : Maybe String
+    , nextReview : Int
     }
 
 
@@ -70,6 +82,7 @@ type Msg
     | KindChanged String
     | OwnerChanged String
     | ShiftChanged String
+    | CompletionChanged String
     | Save
     | Retry
     | Refresh
@@ -77,9 +90,13 @@ type Msg
     | DiscardEdit
     | RestoreEdit
     | PurgeEdit
-    | Toggle Evergreen.V1.Domain.Ref Evergreen.V1.Domain.Completion
+    | Toggle Evergreen.V1.Domain.Ref
+    | ReviewClick Evergreen.V1.Domain.Ref Float
+    | ReviewElapsed ReviewWait
     | Confirm Evergreen.V1.Domain.Ref
     | DiscardRow Evergreen.V1.Domain.Ref
+    | PurgeLast Evergreen.V1.Domain.Owner Evergreen.V1.Domain.Ref
+    | DeleteSeparator Evergreen.V1.Domain.Ref
     | Filter ItemFilter
     | BeginDrag Drag
     | HoverRow Evergreen.V1.Domain.Owner String
@@ -87,3 +104,4 @@ type Msg
     | LeaveGroup Evergreen.V1.Domain.Owner
     | ReleaseDrag
     | CancelDrag
+    | FocusedInput

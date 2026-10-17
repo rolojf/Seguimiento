@@ -53,7 +53,7 @@ async function configure(mode) {
 
   try {
     // Prepare both files before publishing either; raw keys never enter Env.elm.
-    await writeFile(accessTemp, `usuario1: ${userOne.key}\nusuario2: ${userTwo.key}\n`, {
+    await writeFile(accessTemp, `Rolo: ${userOne.key}\nDot: ${userTwo.key}\n`, {
       flag: 'wx',
       mode: FILE_MODE,
     });
@@ -85,7 +85,7 @@ async function main() {
   const args = process.argv.slice(2);
 
   if (args.length === 1 && args[0] === '--help') {
-    console.log('Uso: node scripts/setup-access.mjs [--replace]\nGenera claves locales para usuario1 y usuario2. --replace renueva las existentes.\nGuarda las claves en .local/access.txt y sus hashes SHA256 en src/Env.elm.');
+    console.log('Uso: node scripts/setup-access.mjs [--replace]\nGenera claves locales para Rolo y Dot. --replace renueva las existentes.\nGuarda las claves en .local/access.txt y sus hashes SHA256 en src/Env.elm.');
     return;
   }
 

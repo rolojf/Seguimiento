@@ -62,6 +62,11 @@ type Closure
     | PersonallyClosed String
 
 
+type ProcessStatus
+    = ActiveProcess
+    | CompletedProcess
+
+
 type Target
     = New
     | Existing Ref
@@ -93,12 +98,23 @@ type alias OpportunityFields =
     }
 
 
+type CompletionProposal
+    = NoCompletionProposal
+    | CompletionProposed
+
+
+type OpportunityStatus
+    = ActiveOpportunity CompletionProposal
+    | DiscardedOpportunity
+    | CompletedOpportunity
+
+
 type alias Opportunity =
     { id : String
     , fields : OpportunityFields
     , dx : Float
     , dy : Float
-    , deleted : Bool
+    , status : OpportunityStatus
     , version : Int
     , createdAt : String
     , updatedAt : String
@@ -106,8 +122,15 @@ type alias Opportunity =
     }
 
 
+type PendingStatus
+    = AwaitingApproval User
+    | Approved
+    | CompletedBy User Review
+    | LegacyCompleted
+
+
 type PendingContent
-    = PendingTask String Completion
+    = PendingTask String PendingStatus
     | Separator String
 
 
@@ -124,6 +147,11 @@ type PendingMove
     | ShiftPosition PendingShift
 
 
+type CompletionEdit
+    = KeepCompletion
+    | ChangeCompletion Completion
+
+
 type alias Pending =
     { id : String
     , fields : PendingFields
@@ -131,7 +159,6 @@ type alias Pending =
     , version : Int
     , createdAt : String
     , updatedAt : String
-    , review : Review
     , position : Int
     }
 
@@ -143,6 +170,7 @@ type alias ProcessFields =
 type alias TaskState =
     { applicability : Applicability
     , evidence : Maybe String
+    , notes : String
     , applicabilityReview : Review
     , completionReview : Review
     }
@@ -151,6 +179,7 @@ type alias TaskState =
 type alias Process =
     { id : String
     , fields : ProcessFields
+    , status : ProcessStatus
     , states : Dict String TaskState
     , closure : Closure
     , legacySummary : String
@@ -203,15 +232,24 @@ type Change
     | ConfirmOpportunity Ref
     | RemoveOpportunity Ref
     | RestoreOpportunity Ref
-    | SavePending Target PendingFields PendingMove
+    | SuggestCompletion Ref CompletionProposal
+    | CompleteOpportunity Ref
+    | PurgeOpportunity Ref
+    | SavePending Target PendingFields PendingMove CompletionEdit
     | MovePending Ref PendingShift
-    | CompletePending Ref Completion
+    | TogglePending Ref
+    | RejectPendingCompletion Ref
     | ConfirmPending Ref
     | RemovePending Ref
     | RestorePending Ref
     | PurgePending Ref
+    | PurgeCompleted Owner Ref
+    | PurgeSeparator Ref
     | CreateProcess ProcessFields
     | ChangeTask Ref String TaskChange
+    | CompleteProcess Ref
+    | PurgeProcess Ref
+    | SaveTaskNotes Ref String String
 
 
 empty : Board
@@ -230,6 +268,31 @@ emptyArchive =
     { checks = "[]", snapshots = "[]" }
 
 
+opportunityActive : Opportunity -> Bool
+opportunityActive item =
+    case item.status of
+        ActiveOpportunity _ ->
+            True
+
+        _ ->
+            False
+
+
+opportunityDiscarded : Opportunity -> Bool
+opportunityDiscarded item =
+    item.status == DiscardedOpportunity
+
+
+opportunityComplete : Opportunity -> Bool
+opportunityComplete item =
+    item.status == CompletedOpportunity
+
+
+completionSuggested : Opportunity -> Bool
+completionSuggested item =
+    item.status == ActiveOpportunity CompletionProposed
+
+
 pendingTitle : PendingContent -> String
 pendingTitle content =
     case content of
@@ -243,18 +306,77 @@ pendingTitle content =
 pendingCompletion : PendingContent -> Maybe Completion
 pendingCompletion content =
     case content of
-        PendingTask _ completion ->
-            Just completion
+        PendingTask _ status ->
+            case status of
+                CompletedBy _ _ ->
+                    Just Done
+
+                LegacyCompleted ->
+                    Just Done
+
+                _ ->
+                    Just Todo
 
         Separator _ ->
             Nothing
 
 
+pendingApproval : PendingContent -> Maybe User
+pendingApproval content =
+    case content of
+        PendingTask _ (AwaitingApproval reviewer) ->
+            Just reviewer
+
+        _ ->
+            Nothing
+
+
+pendingReview : PendingContent -> Review
+pendingReview content =
+    case content of
+        PendingTask _ (CompletedBy _ review) ->
+            review
+
+        _ ->
+            Reviewed
+
+
+pendingIsComplete : PendingContent -> Bool
+pendingIsComplete content =
+    case content of
+        PendingTask _ (CompletedBy _ Reviewed) ->
+            True
+
+        PendingTask _ LegacyCompleted ->
+            True
+
+        _ ->
+            False
+
+
 orderedPending : Owner -> Board -> List Pending
 orderedPending owner board =
     Dict.values board.pending
-        |> List.filter (\item -> not item.deleted && item.fields.owner == owner)
+        |> List.filter (\item -> not item.deleted && not (pendingIsComplete item.fields.content) && item.fields.owner == owner)
         |> List.sortBy (\item -> ( item.position, item.createdAt, item.id ))
+
+
+completedPending : Owner -> Board -> List Pending
+completedPending owner board =
+    Dict.values board.pending
+        |> List.filter (\item -> not item.deleted && pendingIsComplete item.fields.content && item.fields.owner == owner)
+        |> List.sortBy (\item -> ( item.updatedAt, item.id ))
+        |> List.reverse
+
+
+userName : User -> String
+userName user =
+    case user of
+        UserOne ->
+            "Rolo"
+
+        UserTwo ->
+            "Dot"
 
 
 ref : { a | id : String, version : Int } -> Ref
@@ -323,10 +445,10 @@ ownerLabel : Owner -> String
 ownerLabel value =
     case value of
         Rolando ->
-            "Rolando"
+            "Rolo"
 
         Dot ->
-            "dot"
+            "Dot"
 
         Others ->
             "Otros"
@@ -348,6 +470,7 @@ taskState id process =
         |> Maybe.withDefault
             { applicability = Applicable Todo
             , evidence = Nothing
+            , notes = ""
             , applicabilityReview = Reviewed
             , completionReview = Reviewed
             }
