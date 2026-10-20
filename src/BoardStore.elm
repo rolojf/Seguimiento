@@ -61,6 +61,7 @@ apply actor now change board =
 
     else
         changeBoard actor now change board
+            |> Result.andThen (syncLinkedPending now board)
             |> Result.map (\updated -> { updated | revision = board.revision + 1 })
 
 
@@ -144,7 +145,7 @@ changeBoard actor now change board =
             discardPending now reference board
 
         RestorePending reference ->
-            restorePending now reference board
+            restorePending actor now reference board
 
         PurgePending reference ->
             purgePending reference board
@@ -159,6 +160,12 @@ changeBoard actor now change board =
             validateProcess fields
                 |> Result.map (\_ -> createProcess now fields board)
 
+        SendToPending reference taskId ->
+            sendToPending actor now reference taskId board
+
+        WithdrawPending reference taskId ->
+            withdrawPending now reference taskId board
+
         ChangeTask reference taskId changeTask ->
             changeProcess actor now reference taskId changeTask board
 
@@ -170,6 +177,123 @@ changeBoard actor now change board =
 
         PurgeProcess reference ->
             purgeProcess actor reference board
+
+
+
+-- Synchronize only status transitions, never deletions: purging a pending preserves its result.
+
+
+syncLinkedPending : String -> Board -> Board -> Result String Board
+syncLinkedPending now previous updated =
+    Dict.values updated.pending
+        |> List.filter
+            (\item ->
+                item.origin
+                    /= Standalone
+                    && not item.deleted
+                    && (case Dict.get item.id previous.pending of
+                            Nothing ->
+                                True
+
+                            Just old ->
+                                old.deleted || pendingStatus old /= pendingStatus item
+                       )
+            )
+        |> List.foldl
+            (\item result -> Result.andThen (syncPendingTask item) result)
+            (Ok updated)
+        |> Result.map
+            (\synced ->
+                { synced
+                    | processes =
+                        Dict.map
+                            (\id process ->
+                                if Maybe.map .states (Dict.get id updated.processes) /= Just process.states then
+                                    touch now process
+
+                                else
+                                    process
+                            )
+                            synced.processes
+                }
+            )
+
+
+pendingStatus : Pending -> Maybe PendingStatus
+pendingStatus item =
+    case item.fields.content of
+        PendingTask _ status ->
+            Just status
+
+        Separator _ ->
+            Nothing
+
+
+syncPendingTask : Pending -> Board -> Result String Board
+syncPendingTask item board =
+    linkedTask item board
+        |> Result.map
+            (\( process, state ) ->
+                let
+                    completion =
+                        if pendingIsComplete item.fields.content then
+                            Done
+
+                        else
+                            Todo
+
+                    updated =
+                        setOwnerState (OwnerState item.fields.owner completion Reviewed) state
+                in
+                case item.origin of
+                    ProcessTask _ taskId ->
+                        { board | processes = Dict.insert process.id { process | states = Dict.insert taskId updated process.states } board.processes }
+
+                    Standalone ->
+                        board
+            )
+
+
+linkedTask : Pending -> Board -> Result String ( Process, TaskState )
+linkedTask item board =
+    case item.origin of
+        Standalone ->
+            Err "El pendiente no está vinculado a un proceso."
+
+        ProcessTask processId taskId ->
+            case Dict.get processId board.processes of
+                Nothing ->
+                    Err "El proceso vinculado ya no existe."
+
+                Just process ->
+                    activeProcess (ref process) board
+                        |> Result.andThen
+                            (\_ ->
+                                case ( List.filter (\task -> task.id == taskId) (tasks process.fields.kind), Dict.get taskId process.states ) of
+                                    ( [ task ], Just state ) ->
+                                        assignedOwner task item.fields.owner
+                                            |> Result.andThen
+                                                (\_ ->
+                                                    if state.applicability == Applicable then
+                                                        Ok ( process, state )
+
+                                                    else
+                                                        Err "Restaura la actividad cancelada antes de recuperar o reabrir sus pendientes."
+                                                )
+
+                                    _ ->
+                                        Err "La actividad vinculada no pertenece al proceso."
+                            )
+
+
+pendingProcess : Pending -> Maybe String
+pendingProcess item =
+    case item.origin of
+        Standalone ->
+            Nothing
+
+        ProcessTask processId _ ->
+            Just processId
 
 
 saveOpportunity : User -> String -> Target -> OpportunityFields -> Board -> Result String Board
@@ -227,7 +351,7 @@ savePending actor now target fields move completionEdit board =
                                                         freshId board
 
                                                     item =
-                                                        Pending id updatedFields False initialVersion now now (List.length (orderedPending updatedFields.owner board))
+                                                        Pending id updatedFields False initialVersion now now (List.length (orderedPending updatedFields.owner board)) Standalone
 
                                                     saved =
                                                         { board | pending = Dict.insert id item board.pending, nextId = nextId }
@@ -241,7 +365,13 @@ savePending actor now target fields move completionEdit board =
 
 saveExistingPending : User -> String -> PendingFields -> PendingMove -> CompletionEdit -> Pending -> Board -> Result String Board
 saveExistingPending actor now fields move completionEdit item board =
-    if pendingCompletion item.fields.content == Just Done && fields.owner /= item.fields.owner then
+    if item.origin /= Standalone && fields.owner /= item.fields.owner then
+        Err "El responsable de un pendiente vinculado pertenece al proceso y no se puede cambiar."
+
+    else if item.origin /= Standalone && pendingCompletion fields.content == Nothing then
+        Err "Un pendiente vinculado a un proceso no se puede convertir en separador."
+
+    else if pendingCompletion item.fields.content == Just Done && fields.owner /= item.fields.owner then
         Err "Reabre el pendiente antes de cambiar su responsable."
 
     else if pendingCompletion item.fields.content == Just Done && pendingCompletion fields.content == Nothing then
@@ -505,8 +635,8 @@ discardPending now reference board =
             )
 
 
-restorePending : String -> Ref -> Board -> Result String Board
-restorePending now reference board =
+restorePending : User -> String -> Ref -> Board -> Result String Board
+restorePending actor now reference board =
     current reference board.pending
         |> Result.andThen
             (\item ->
@@ -516,6 +646,12 @@ restorePending now reference board =
                             touch now
                                 { item
                                     | deleted = False
+                                    , fields =
+                                        if item.origin /= Standalone && not (pendingIsComplete item.fields.content) then
+                                            withApproval actor item.fields
+
+                                        else
+                                            item.fields
                                     , position =
                                         if pendingIsComplete item.fields.content then
                                             item.position
@@ -773,7 +909,7 @@ createProcess now fields board =
 
         states =
             tasks fields.kind
-                |> List.map (\task -> ( task.id, TaskState (Applicable Todo) Nothing "" Reviewed Reviewed ))
+                |> List.map (\task -> ( task.id, initialTaskState task ))
                 |> Dict.fromList
 
         item =
@@ -875,6 +1011,183 @@ purgeOpportunity actor reference board =
                 )
 
 
+assignedOwner : Task -> Owner -> Result String ()
+assignedOwner task owner =
+    if List.member owner (taskOwners task) then
+        Ok ()
+
+    else
+        Err "El responsable no está asignado a esta actividad."
+
+
+setOwnerState : OwnerState -> TaskState -> TaskState
+setOwnerState part state =
+    { state
+        | completions =
+            if List.any (\currentPart -> currentPart.owner == part.owner) state.completions then
+                List.map
+                    (\currentPart ->
+                        if currentPart.owner == part.owner then
+                            part
+
+                        else
+                            currentPart
+                    )
+                    state.completions
+
+            else
+                state.completions ++ [ part ]
+    }
+
+
+checkTaskLink : String -> String -> TaskChange -> Board -> Result String ()
+checkTaskLink processId taskId change board =
+    case change of
+        SetCompletion owner _ ->
+            if Dict.values board.pending |> List.any (\item -> item.origin == ProcessTask processId taskId && item.fields.owner == owner && not item.deleted) then
+                Err "Gestiona el cumplimiento de este responsable desde Pendientes."
+
+            else
+                Ok ()
+
+        _ ->
+            Ok ()
+
+
+sendToPending : User -> String -> Ref -> String -> Board -> Result String Board
+sendToPending actor now reference taskId board =
+    activeProcess reference board
+        |> Result.andThen
+            (\process ->
+                case ( List.filter (\task -> task.id == taskId) (tasks process.fields.kind), Dict.get taskId process.states ) of
+                    ( [ task ], Just state ) ->
+                        if state.applicability == NotApplicable then
+                            Err "Restaura la actividad antes de enviarla a Pendientes."
+
+                        else
+                            taskOwners task
+                                |> List.filter (\owner -> (ownerState owner state).completion /= Done)
+                                |> List.foldl (sendOwnerPending actor now process task) board
+                                |> advancePendingOrder board
+                                |> advanceLinkVersion now process board
+                                |> Ok
+
+                    _ ->
+                        Err "El paso no pertenece a la plantilla del proceso."
+            )
+
+
+sendOwnerPending : User -> String -> Process -> Task -> Owner -> Board -> Board
+sendOwnerPending actor now process task owner board =
+    case linkedPending process.id task.id owner board of
+        Just item ->
+            if not item.deleted || pendingIsComplete item.fields.content then
+                board
+
+            else
+                let
+                    restored =
+                        touch now
+                            { item
+                                | deleted = False
+                                , fields = withApproval actor item.fields
+                                , position = List.length (orderedPending owner board)
+                            }
+                in
+                { board | pending = Dict.insert item.id restored board.pending }
+                    |> normalizePending owner
+
+        Nothing ->
+            let
+                ( id, nextId ) =
+                    freshId board
+
+                prefix =
+                    String.left (titleLimit // 3) process.fields.client ++ " " ++ processLabel process.fields.kind ++ " "
+
+                title =
+                    prefix ++ String.left (titleLimit - String.length prefix) task.label
+
+                fields =
+                    PendingFields (PendingTask title (initialApproval actor owner)) owner
+
+                item =
+                    Pending id fields False initialVersion now now (List.length (orderedPending owner board)) (ProcessTask process.id task.id)
+            in
+            { board | pending = Dict.insert id item board.pending, nextId = nextId }
+                |> normalizePending owner
+
+
+
+-- Detach finalized copies without touching their completion date or the task's reviews.
+
+
+withdrawPending : String -> Ref -> String -> Board -> Result String Board
+withdrawPending now reference taskId board =
+    activeProcess reference board
+        |> Result.andThen
+            (\process ->
+                case ( List.filter (\task -> task.id == taskId) (tasks process.fields.kind), Dict.get taskId process.states ) of
+                    ( [ _ ], Just _ ) ->
+                        { board
+                            | pending =
+                                Dict.map
+                                    (\_ item ->
+                                        if item.origin == ProcessTask process.id taskId && pendingIsComplete item.fields.content then
+                                            { item | origin = Standalone, version = item.version + 1 }
+
+                                        else
+                                            item
+                                    )
+                                    board.pending
+                        }
+                            |> discardTaskPending now process.id taskId
+                            |> advanceLinkVersion now process board
+                            |> Ok
+
+                    _ ->
+                        Err "El paso no pertenece a la plantilla del proceso."
+            )
+
+
+
+-- Link changes invalidate earlier send/withdraw intentions even when task states stay the same.
+
+
+advanceLinkVersion : String -> Process -> Board -> Board -> Board
+advanceLinkVersion now process previous updated =
+    if previous.pending == updated.pending then
+        updated
+
+    else
+        { updated | processes = Dict.insert process.id (touch now process) updated.processes }
+
+
+
+-- Cancellation retains finalized work and discards every unfinished linked pending atomically.
+
+
+discardTaskPending : String -> String -> String -> Board -> Board
+discardTaskPending now processId taskId board =
+    let
+        discarded =
+            { board
+                | pending =
+                    Dict.map
+                        (\_ item ->
+                            if item.origin == ProcessTask processId taskId && not item.deleted && not (pendingIsComplete item.fields.content) then
+                                touch now { item | deleted = True }
+
+                            else
+                                item
+                        )
+                        board.pending
+            }
+    in
+    List.foldl normalizePending discarded [ Rolando, Dot, Others ]
+        |> advancePendingOrder board
+
+
 changeProcess : User -> String -> Ref -> String -> TaskChange -> Board -> Result String Board
 changeProcess actor now reference taskId change board =
     activeProcess reference board
@@ -882,13 +1195,14 @@ changeProcess actor now reference taskId change board =
             (\process ->
                 case ( List.filter (\task -> task.id == taskId) (tasks process.fields.kind), Dict.get taskId process.states ) of
                     ( [ task ], Just state ) ->
-                        updateTask actor task change state
+                        checkTaskLink process.id taskId change board
+                            |> Result.andThen (\_ -> updateTask actor task change state)
                             |> Result.map
                                 (\updated ->
                                     let
                                         -- Recognizing an alert changes its version, not the business timestamp.
                                         updatedAt =
-                                            if updated.applicability == state.applicability then
+                                            if updated.applicability == state.applicability && List.map .completion updated.completions == List.map .completion state.completions then
                                                 process.updatedAt
 
                                             else
@@ -900,8 +1214,15 @@ changeProcess actor now reference taskId change board =
                                                 , version = process.version + 1
                                                 , updatedAt = updatedAt
                                             }
+
+                                        saved =
+                                            { board | processes = Dict.insert process.id changed board.processes }
                                     in
-                                    { board | processes = Dict.insert process.id changed board.processes }
+                                    if updated.applicability == NotApplicable then
+                                        discardTaskPending now process.id taskId saved
+
+                                    else
+                                        saved
                                 )
 
                     _ ->
@@ -933,9 +1254,13 @@ completeProcess actor now reference board =
 
     else
         activeProcess reference board
-            |> Result.map
+            |> Result.andThen
                 (\process ->
-                    { board | processes = Dict.insert process.id (touch now { process | status = CompletedProcess }) board.processes }
+                    if Dict.values board.pending |> List.any (\item -> pendingProcess item == Just process.id && not item.deleted && not (pendingIsComplete item.fields.content)) then
+                        Err "Finaliza o descarta los pendientes vinculados antes de completar el proceso."
+
+                    else
+                        Ok { board | processes = Dict.insert process.id (touch now { process | status = CompletedProcess }) board.processes }
                 )
 
 
@@ -949,7 +1274,20 @@ purgeProcess actor reference board =
             |> Result.andThen
                 (\process ->
                     if process.status == CompletedProcess then
-                        Ok { board | processes = Dict.remove process.id board.processes }
+                        Ok
+                            { board
+                                | processes = Dict.remove process.id board.processes
+                                , pending =
+                                    Dict.map
+                                        (\_ item ->
+                                            if pendingProcess item == Just process.id then
+                                                { item | origin = Standalone, version = item.version + 1 }
+
+                                            else
+                                                item
+                                        )
+                                        board.pending
+                            }
 
                     else
                         Err "Completa el proceso antes de borrarlo definitivamente."
@@ -985,24 +1323,19 @@ saveTaskNotes now reference taskId notes board =
 updateTask : User -> Task -> TaskChange -> TaskState -> Result String TaskState
 updateTask actor task change state =
     case change of
-        SetCompletion completion ->
-            canChange actor state.completionReview
+        SetCompletion owner completion ->
+            assignedOwner task owner
+                |> Result.andThen (\_ -> canChange actor (ownerState owner state).review)
                 |> Result.andThen
                     (\_ ->
-                        case state.applicability of
-                            NotApplicable _ ->
-                                Err "Restaura el paso antes de cambiar su confirmación."
+                        if state.applicability == NotApplicable then
+                            Err "Restaura el paso antes de cambiar su confirmación."
 
-                            Applicable previous ->
-                                if previous == completion then
-                                    Ok state
+                        else if (ownerState owner state).completion == completion then
+                            Ok state
 
-                                else
-                                    Ok
-                                        { state
-                                            | applicability = Applicable completion
-                                            , completionReview = NeedsReview (otherUser actor)
-                                        }
+                        else
+                            Ok (setOwnerState (OwnerState owner completion (NeedsReview (otherUser actor))) state)
                     )
 
         ExcludeTask ->
@@ -1012,36 +1345,39 @@ updateTask actor task change state =
                         if not task.allowNotApplicable then
                             Err "Este paso no permite marcar No aplica."
 
-                        else
-                            case state.applicability of
-                                NotApplicable _ ->
-                                    Ok state
+                        else if state.applicability == NotApplicable then
+                            Ok state
 
-                                Applicable previous ->
-                                    Ok
-                                        { state
-                                            | applicability = NotApplicable previous
-                                            , applicabilityReview = NeedsReview (otherUser actor)
-                                        }
+                        else
+                            Ok
+                                { state
+                                    | applicability = NotApplicable
+                                    , applicabilityReview = NeedsReview (otherUser actor)
+                                }
                     )
 
         RestoreTask ->
             canChange actor state.applicabilityReview
                 |> Result.map
                     (\_ ->
-                        case state.applicability of
-                            Applicable _ ->
-                                state
+                        if state.applicability == Applicable then
+                            state
 
-                            NotApplicable previous ->
-                                { state
-                                    | applicability = Applicable previous
-                                    , applicabilityReview = NeedsReview (otherUser actor)
-                                }
+                        else
+                            { state
+                                | applicability = Applicable
+                                , applicabilityReview = NeedsReview (otherUser actor)
+                            }
                     )
 
         Acknowledge checkbox ->
-            acknowledge actor checkbox state
+            case checkbox of
+                CompletionBox owner ->
+                    assignedOwner task owner
+                        |> Result.andThen (\_ -> acknowledge actor checkbox state)
+
+                ApplicabilityBox ->
+                    acknowledge actor checkbox state
 
 
 canChange : User -> Review -> Result String ()
@@ -1065,8 +1401,8 @@ acknowledge actor checkbox state =
                 ApplicabilityBox ->
                     state.applicabilityReview
 
-                CompletionBox ->
-                    state.completionReview
+                CompletionBox owner ->
+                    (ownerState owner state).review
     in
     if review /= NeedsReview actor then
         Err "Esta casilla no tiene un cambio pendiente de tu reconocimiento."
@@ -1076,8 +1412,12 @@ acknowledge actor checkbox state =
             ApplicabilityBox ->
                 Ok { state | applicabilityReview = Reviewed }
 
-            CompletionBox ->
-                Ok { state | completionReview = Reviewed }
+            CompletionBox owner ->
+                let
+                    part =
+                        ownerState owner state
+                in
+                Ok (setOwnerState { part | review = Reviewed } state)
 
 
 otherUser : User -> User

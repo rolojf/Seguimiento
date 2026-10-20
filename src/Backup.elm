@@ -15,6 +15,11 @@ formatName =
 
 formatVersion : Int
 formatVersion =
+    4
+
+
+singleOwnerVersion : Int
+singleOwnerVersion =
     3
 
 
@@ -51,6 +56,7 @@ maxTaskNotes =
 type RowFormat
     = LegacyRows
     | CurrentRows
+    | MultiOwnerRows
 
 
 decode : String -> Result String ( Board, Archive )
@@ -64,11 +70,14 @@ backupDecoder =
         |> D.andThen
             (\( format, version ) ->
                 if format == formatName && version == formatVersion then
-                    currentBackup CurrentRows (rows (pendingDecoder pendingContent) |> verified validPendingOrder)
+                    currentBackup MultiOwnerRows (rows (pendingDecoder MultiOwnerRows pendingContent) |> verified validPendingOrder)
+
+                else if format == formatName && version == singleOwnerVersion then
+                    currentBackup CurrentRows (rows (pendingDecoder CurrentRows pendingContent) |> verified validPendingOrder)
 
                 else if format == formatName && version == previousVersion then
                     currentBackup LegacyRows
-                        (rows (pendingDecoder previousContent)
+                        (rows (pendingDecoder LegacyRows previousContent)
                             |> verified validPreviousOrder
                             |> D.map reindexPending
                         )
@@ -135,6 +144,14 @@ tablesDecoder rowFormat pendingRows =
             (D.field "pending" pendingRows)
             (D.field "processes" (rows (processDecoder rowFormat)))
             (D.field "process_snapshots" (archiveRows snapshotDecoder))
+            |> verified
+                (\( board, _ ) ->
+                    if rowFormat == MultiOwnerRows then
+                        validateLinks board
+
+                    else
+                        Ok ()
+                )
         )
 
 
@@ -146,7 +163,7 @@ opportunityDecoder format =
                 LegacyRows ->
                     []
 
-                CurrentRows ->
+                _ ->
                     [ "status", "completionSuggested" ]
     in
     strict
@@ -185,7 +202,7 @@ opportunityState format =
         LegacyRows ->
             legacy
 
-        CurrentRows ->
+        _ ->
             -- Older version 3 rows infer their state from deleted and have no proposal.
             D.map3
                 (\old explicit suggested ->
@@ -254,7 +271,7 @@ legacyPending =
         []
         (D.map6
             (\id fields deleted version createdAt updatedAt ->
-                Pending id fields deleted version createdAt updatedAt 0
+                Pending id fields deleted version createdAt updatedAt 0 Standalone
             )
             (D.field "id" identifier)
             (D.map3 (\title owner status -> PendingFields (PendingTask title status) owner)
@@ -270,14 +287,19 @@ legacyPending =
         )
 
 
-pendingDecoder : Decoder PendingContent -> Decoder Pending
-pendingDecoder contentDecoder =
-    strict [ "id", "content", "owner", "position", "version", "deleted", "created_at", "updated_at" ]
+pendingDecoder : RowFormat -> Decoder PendingContent -> Decoder Pending
+pendingDecoder format contentDecoder =
+    strict
+        ([ "id", "content", "owner", "position", "version", "deleted", "created_at", "updated_at" ]
+            ++ (if format == MultiOwnerRows then
+                    [ "origin" ]
+
+                else
+                    []
+               )
+        )
         []
-        (D.map7
-            (\id fields deleted version createdAt updatedAt position ->
-                Pending id fields deleted version createdAt updatedAt position
-            )
+        (D.map8 Pending
             (D.field "id" identifier)
             (D.map2 PendingFields
                 (D.field "content" contentDecoder)
@@ -289,7 +311,35 @@ pendingDecoder contentDecoder =
             (D.field "created_at" timestampDecoder)
             (D.field "updated_at" timestampDecoder)
             (D.field "position" nonnegativeInt)
+            (if format == MultiOwnerRows then
+                D.field "origin" originDecoder
+
+             else
+                D.succeed Standalone
+            )
         )
+
+
+originDecoder : Decoder PendingOrigin
+originDecoder =
+    D.field "type" D.string
+        |> D.andThen
+            (\kind ->
+                case kind of
+                    "standalone" ->
+                        strict [ "type" ] [] (D.succeed Standalone)
+
+                    "processTask" ->
+                        strict [ "type", "processId", "taskId" ]
+                            []
+                            (D.map2 ProcessTask
+                                (D.field "processId" identifier)
+                                (D.field "taskId" identifier)
+                            )
+
+                    _ ->
+                        D.fail "Origen de pendiente no reconocido."
+            )
 
 
 pendingContent : Decoder PendingContent
@@ -473,6 +523,9 @@ processDecoder format =
                 CurrentRows ->
                     -- Earlier version 3 exports did not include a process status.
                     ( [ "status" ], optional "status" processStatus |> D.map (Maybe.withDefault ActiveProcess) )
+
+                MultiOwnerRows ->
+                    ( [ "status" ], D.field "status" processStatus )
     in
     strict
         [ "id", "client", "type", "start_date", "context", "template_version", "states", "closed_override", "closed_reason", "legacy_summary", "version", "created_at", "updated_at" ]
@@ -491,7 +544,7 @@ processDecoder format =
                                 |> verified BoardStore.validateProcess
                             )
                         |> using statusDecoder
-                        |> using (D.field "states" (jsonString (D.dict (taskDecoder format) |> verified (validateStates kind))))
+                        |> using (D.field "states" (jsonString (statesDecoder format kind)))
                         |> using closureDecoder
                         |> using (D.field "legacy_summary" D.string)
                         |> using (D.field "template_version" (exactInt templateVersion))
@@ -535,15 +588,81 @@ closureDecoder =
             )
 
 
-taskDecoder : RowFormat -> Decoder TaskState
-taskDecoder format =
+statesDecoder : RowFormat -> ProcessKind -> Decoder (Dict String TaskState)
+statesDecoder format kind =
+    let
+        template =
+            tasks kind
+    in
+    strict (List.map .id template)
+        []
+        (List.foldl
+            (\task decoder ->
+                D.map2 (Dict.insert task.id)
+                    (D.field task.id (taskDecoder format task))
+                    decoder
+            )
+            (D.succeed Dict.empty)
+            template
+        )
+        |> verified (validateStates kind)
+
+
+taskDecoder : RowFormat -> Task -> Decoder TaskState
+taskDecoder format task =
+    if format == MultiOwnerRows then
+        strict [ "applicability", "completions", "notes" ]
+            [ "evidence" ]
+            (D.map4
+                (\applicability completions evidence notes ->
+                    TaskState applicability completions evidence notes Reviewed
+                )
+                (D.field "applicability" applicabilityDecoder)
+                (D.field "completions" (D.list ownerStateDecoder))
+                (optional "evidence" D.string)
+                (D.field "notes" taskNotes)
+            )
+
+    else
+        oldTaskDecoder format task
+
+
+applicabilityDecoder : Decoder Applicability
+applicabilityDecoder =
+    D.string
+        |> D.andThen
+            (\value ->
+                case value of
+                    "applicable" ->
+                        D.succeed Applicable
+
+                    "not_applicable" ->
+                        D.succeed NotApplicable
+
+                    _ ->
+                        D.fail "Aplicabilidad de tarea no reconocida."
+            )
+
+
+ownerStateDecoder : Decoder OwnerState
+ownerStateDecoder =
+    strict [ "owner", "completion" ]
+        []
+        (D.map2 (\owner completion -> OwnerState owner completion Reviewed)
+            (D.field "owner" ownerDecoder)
+            (D.field "completion" completionDecoder)
+        )
+
+
+oldTaskDecoder : RowFormat -> Task -> Decoder TaskState
+oldTaskDecoder format task =
     let
         ( extra, notesDecoder ) =
             case format of
                 LegacyRows ->
                     ( [], D.succeed "" )
 
-                CurrentRows ->
+                _ ->
                     ( [ "notes" ], optional "notes" taskNotes |> D.map (Maybe.withDefault "") )
     in
     strict [ "status" ]
@@ -553,7 +672,9 @@ taskDecoder format =
                 (\status ->
                     if status == "not_applicable" then
                         D.map4
-                            (\previous _ evidence notes -> TaskState (NotApplicable previous) evidence notes Reviewed Reviewed)
+                            (\previous _ evidence notes ->
+                                TaskState NotApplicable (oldCompletions task previous) evidence notes Reviewed
+                            )
                             (D.field "priorStatus" completionDecoder)
                             (optional "reason" D.string)
                             (optional "evidence" D.string)
@@ -564,7 +685,7 @@ taskDecoder format =
                             |> D.andThen
                                 (\completion ->
                                     -- Legacy comments are deliberately discarded; reviews begin acknowledged.
-                                    D.map4 (\_ _ evidence notes -> TaskState (Applicable completion) evidence notes Reviewed Reviewed)
+                                    D.map4 (\_ _ evidence notes -> TaskState Applicable (oldCompletions task completion) evidence notes Reviewed)
                                         (optional "reason" D.string)
                                         (optional "priorStatus" completionDecoder)
                                         (optional "evidence" D.string)
@@ -572,6 +693,11 @@ taskDecoder format =
                                 )
                 )
         )
+
+
+oldCompletions : Task -> Completion -> List OwnerState
+oldCompletions task completion =
+    List.map (\owner -> OwnerState owner completion Reviewed) (taskOwners task)
 
 
 taskNotes : Decoder String
@@ -598,7 +724,7 @@ validateStates kind states =
 
         unsupported task =
             case Dict.get task.id states |> Maybe.map .applicability of
-                Just (NotApplicable _) ->
+                Just NotApplicable ->
                     not task.allowNotApplicable
 
                 _ ->
@@ -610,8 +736,104 @@ validateStates kind states =
     else if List.any unsupported template then
         Err "Un paso de esta plantilla no permite No aplica."
 
+    else if
+        List.any
+            (\task ->
+                Dict.get task.id states
+                    |> Maybe.map
+                        (\state ->
+                            let
+                                owners =
+                                    List.map .owner state.completions
+
+                                assigned =
+                                    taskOwners task
+                            in
+                            List.length owners
+                                /= List.length assigned
+                                || not (List.all (\owner -> List.member owner owners) assigned)
+                        )
+                    |> Maybe.withDefault True
+            )
+            template
+    then
+        Err "El cumplimiento debe contener exactamente una entrada por responsable asignado."
+
     else
         Ok ()
+
+
+validateLinks : Board -> Result String ()
+validateLinks board =
+    Dict.values board.pending
+        |> List.foldl
+            (\item result ->
+                result
+                    |> Result.andThen
+                        (\seen ->
+                            case item.origin of
+                                Standalone ->
+                                    Ok seen
+
+                                ProcessTask processId taskId ->
+                                    let
+                                        key =
+                                            ( processId, taskId, item.fields.owner )
+                                    in
+                                    if List.member key seen then
+                                        Err "Hay pendientes con el mismo vínculo de proceso, tarea y responsable."
+
+                                    else
+                                        validateLink board item processId taskId
+                                            |> Result.map (\_ -> key :: seen)
+                        )
+            )
+            (Ok [])
+        |> Result.map (\_ -> ())
+
+
+validateLink : Board -> Pending -> String -> String -> Result String ()
+validateLink board item processId taskId =
+    case item.fields.content of
+        Separator _ ->
+            Err "Un separador no puede estar vinculado a un proceso."
+
+        PendingTask _ _ ->
+            case Dict.get processId board.processes of
+                Nothing ->
+                    Err "El proceso vinculado al pendiente no existe."
+
+                Just process ->
+                    case List.filter (\task -> task.id == taskId) (tasks process.fields.kind) |> List.head of
+                        Nothing ->
+                            Err "La tarea vinculada al pendiente no existe."
+
+                        Just task ->
+                            let
+                                state =
+                                    taskState taskId process
+
+                                complete =
+                                    pendingIsComplete item.fields.content
+                            in
+                            if not (List.member item.fields.owner (taskOwners task)) then
+                                Err "El responsable del pendiente no está asignado a la tarea vinculada."
+
+                            else if item.deleted then
+                                -- Discarded links retain their own history, not the current task completion.
+                                Ok ()
+
+                            else if not complete && state.applicability == NotApplicable then
+                                Err "Una actividad cancelada no puede tener pendientes vinculados abiertos."
+
+                            else if not complete && process.status == CompletedProcess then
+                                Err "Un proceso completado no puede tener pendientes vinculados abiertos."
+
+                            else if ((ownerState item.fields.owner state).completion == Done) /= complete then
+                                Err "El cumplimiento de la tarea no coincide con el pendiente vinculado."
+
+                            else
+                                Ok ()
 
 
 checkDecoder : Decoder { id : String }
@@ -1110,11 +1332,26 @@ encodePending item =
         ([ ( "id", E.string item.id )
          , ( "content", encodePendingContent item.fields.content )
          , ( "owner", E.string (ownerLabel item.fields.owner) )
+         , ( "origin", encodeOrigin item.origin )
          , ( "position", E.int item.position )
          , ( "deleted", encodeBool item.deleted )
          ]
             ++ encodeMeta item
         )
+
+
+encodeOrigin : PendingOrigin -> E.Value
+encodeOrigin origin =
+    case origin of
+        Standalone ->
+            E.object [ ( "type", E.string "standalone" ) ]
+
+        ProcessTask processId taskId ->
+            E.object
+                [ ( "type", E.string "processTask" )
+                , ( "processId", E.string processId )
+                , ( "taskId", E.string taskId )
+                ]
 
 
 encodePendingContent : PendingContent -> E.Value
@@ -1213,12 +1450,18 @@ encodeTask : TaskState -> E.Value
 encodeTask state =
     let
         fields =
-            case state.applicability of
-                Applicable completion ->
-                    [ ( "status", E.string (completionName completion) ) ]
+            [ ( "applicability"
+              , E.string
+                    (case state.applicability of
+                        Applicable ->
+                            "applicable"
 
-                NotApplicable previous ->
-                    [ ( "status", E.string "not_applicable" ), ( "priorStatus", E.string (completionName previous) ) ]
+                        NotApplicable ->
+                            "not_applicable"
+                    )
+              )
+            , ( "completions", E.list encodeOwnerState state.completions )
+            ]
 
         evidence =
             case state.evidence of
@@ -1229,6 +1472,14 @@ encodeTask state =
                     []
     in
     E.object (fields ++ evidence ++ [ ( "notes", E.string state.notes ) ])
+
+
+encodeOwnerState : OwnerState -> E.Value
+encodeOwnerState state =
+    E.object
+        [ ( "owner", E.string (ownerLabel state.owner) )
+        , ( "completion", E.string (completionName state.completion) )
+        ]
 
 
 completionName : Completion -> String

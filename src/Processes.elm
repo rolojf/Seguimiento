@@ -3,7 +3,7 @@ module Processes exposing (Model, Msg, init, isLocal, isModal, settle, subscript
 import Browser.Dom
 import Browser.Events
 import Dict
-import Domain exposing (Applicability(..), Board, Change(..), Checkbox(..), Closure(..), Completion(..), Process, ProcessFields, ProcessKind(..), ProcessStatus(..), Ref, Review(..), SaveState(..), Task, TaskChange(..), User(..))
+import Domain exposing (Applicability(..), Board, Change(..), Checkbox(..), Closure(..), Completion(..), Owner(..), Process, ProcessFields, ProcessKind(..), ProcessStatus(..), Ref, Review(..), SaveState(..), Task, TaskChange(..), User(..))
 import Html exposing (Html, button, caption, details, div, form, h2, h3, input, label, option, p, progress, section, select, span, strong, summary, table, tbody, td, text, textarea, th, thead, tr)
 import Html.Attributes as Attr exposing (attribute, checked, class, disabled, for, id, maxlength, placeholder, required, rows, scope, selected, type_, value)
 import Html.Events exposing (onBlur, onCheck, onClick, onFocus, onInput, onMouseEnter, onMouseLeave, onSubmit, preventDefaultOn)
@@ -82,6 +82,8 @@ type Msg
     | Create
     | SelectFilter ProcessStatus
     | ChangeStatus Ref String TaskChange
+    | SendTask Ref String
+    | WithdrawTask Ref String
     | OpenNotes NotesAccess NotesDraft
     | EditNotes String
     | SaveNotes
@@ -149,6 +151,12 @@ update msg _ ((Model state) as model) =
 
         ( ChangeStatus processRef taskId change, Browsing ) ->
             ( Model { state | error = "" }, Cmd.none, Just (ChangeTask processRef taskId change) )
+
+        ( SendTask processRef taskId, Browsing ) ->
+            ( Model { state | error = "" }, Cmd.none, Just (SendToPending processRef taskId) )
+
+        ( WithdrawTask processRef taskId, Browsing ) ->
+            ( Model { state | error = "" }, Cmd.none, Just (WithdrawPending processRef taskId) )
 
         ( OpenNotes access draft, Browsing ) ->
             ( Model { state | editor = TakingNotes access draft, error = "", tooltip = Hidden, focus = Nothing }, focusOn "process-note-text", Nothing )
@@ -419,11 +427,11 @@ view saving user board ((Model state) as model) =
                     ]
 
               else
-                Keyed.node "div" [ class "grid grid-cols-1 items-start gap-4 xl:grid-cols-2" ] (List.map (\process -> ( process.id, processView saving user model process )) processes)
+                Keyed.node "div" [ class "grid grid-cols-1 items-start gap-4 xl:grid-cols-2" ] (List.map (\process -> ( process.id, processView saving user board model process )) processes)
             , p [ class "text-sm text-slate-500" ]
                 [ text
                     (if state.filter == ActiveProcess then
-                        "N/A excluye el paso del avance y conserva su estado. «!» indica un cambio de otro usuario: el primer clic lo reconoce y el siguiente cambia la casilla."
+                        "Pend crea copias para los responsables que aún no terminan. Desmarcar mueve las copias abiertas a Descartados y conserva las completadas, sin cambiar el cumplimiento del proceso. La X cancela el paso. «!» indica un cambio de otro usuario: el primer clic lo reconoce y el siguiente cambia el estado."
 
                      else
                         "Los procesos completados se conservan para consulta."
@@ -765,8 +773,8 @@ nextFocus targets current direction =
     List.drop index targets |> List.head |> Maybe.withDefault "process-dialog"
 
 
-processView : SaveState -> User -> Model -> Process -> Html Msg
-processView saving user model process =
+processView : SaveState -> User -> Board -> Model -> Process -> Html Msg
+processView saving user board model process =
     details [ class "min-w-0 rounded-xl border border-slate-200 bg-white shadow-sm" ]
         [ summary [ class "cursor-pointer break-words rounded-xl p-3 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600" ]
             [ span [ class "font-semibold text-slate-900" ] [ text process.fields.client ]
@@ -795,18 +803,19 @@ processView saving user model process =
             , div []
                 [ table [ class "w-full table-fixed border-collapse text-base" ]
                     [ caption [ class "sr-only" ]
-                        [ text (Domain.processLabel process.fields.kind ++ " de " ++ process.fields.client ++ ". Cada paso tiene un solo responsable.") ]
+                        [ text (Domain.processLabel process.fields.kind ++ " de " ++ process.fields.client ++ ". Cumplimiento independiente por responsable.") ]
                     , thead []
                         [ tr []
-                            [ th [ scope "col", class "w-8 border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600" ] [ text "N/A" ]
+                            [ th [ scope "col", class "w-10 border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600", Attr.title "Crear o retirar copias en Pendientes" ] [ text "Pend" ]
                             , th [ scope "col", class "border-b border-slate-200 px-1 py-2 text-left text-sm font-medium text-slate-600", Attr.style "overflow-wrap" "anywhere" ] [ text "Descripción" ]
-                            , ownerHeading "dot"
-                            , ownerHeading "Rolando"
-                            , ownerHeading "Otros"
+                            , ownerHeading Dot
+                            , ownerHeading Rolando
+                            , ownerHeading Others
                             , th [ scope "col", class "w-10 border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600" ] [ text "Notas" ]
+                            , th [ scope "col", class "w-10 border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600" ] [ span [ class "sr-only" ] [ text "Cancelar o restaurar" ] ]
                             ]
                         ]
-                    , tbody [] (List.map (taskRow saving user model process) (Domain.tasks process.fields.kind))
+                    , tbody [] (List.map (taskRow saving user board model process) (Domain.tasks process.fields.kind))
                     ]
                 ]
             ]
@@ -912,12 +921,26 @@ nextStep process =
         let
             pending =
                 Domain.tasks process.fields.kind
-                    |> List.filter (\task -> (Domain.taskState task.id process).applicability == Applicable Todo)
+                    |> List.filter
+                        (\task ->
+                            let
+                                current =
+                                    Domain.taskState task.id process
+                            in
+                            current.applicability == Applicable && not (Domain.taskComplete task current)
+                        )
 
             description =
                 case List.head pending of
                     Just task ->
-                        "Sigue: " ++ task.label ++ " · " ++ ownerLabel task.owner
+                        "Sigue: "
+                            ++ task.label
+                            ++ " · "
+                            ++ (Domain.taskOwners task
+                                    |> List.filter (\owner -> (Domain.ownerState owner (Domain.taskState task.id process)).completion /= Done)
+                                    |> List.map Domain.ownerLabel
+                                    |> String.join ", "
+                               )
 
                     Nothing ->
                         if (Domain.progress process).applicable == 0 then
@@ -942,18 +965,18 @@ legacyView legacy =
             ]
 
 
-taskRow : SaveState -> User -> Model -> Process -> Task -> Html Msg
-taskRow saving user (Model state) process task =
+taskRow : SaveState -> User -> Board -> Model -> Process -> Task -> Html Msg
+taskRow saving user board (Model state) process task =
     let
         current =
             Domain.taskState task.id process
     in
     tr []
         ([ td [ class "border-b border-slate-100 py-1 align-top" ]
-            [ fieldBox saving user state.editor process task ApplicabilityBox ]
+            [ sendBox saving board state.editor process task ]
          , td [ class "border-b border-slate-100 px-1 py-1 align-top" ]
             [ taskName state.tooltip process task
-            , if process.closure /= Open && current.applicability == Applicable Todo then
+            , if process.closure /= Open && current.applicability == Applicable && not (Domain.taskComplete task current) then
                 p [ class "text-sm text-amber-800", Attr.style "overflow-wrap" "anywhere" ] [ text "Por confirmar" ]
 
               else
@@ -967,8 +990,10 @@ taskRow saving user (Model state) process task =
                     text ""
             ]
          ]
-            ++ List.map (ownerCell saving user state.editor process task) [ "dot", "Rolando", "Otros" ]
-            ++ [ notesCell saving state.editor process task ]
+            ++ List.map (ownerCell saving user board state.editor process task) [ Dot, Rolando, Others ]
+            ++ [ notesCell saving state.editor process task
+               , cancelCell saving user state.editor process task
+               ]
         )
 
 
@@ -1043,194 +1068,267 @@ notesCell saving editor process task =
         ]
 
 
-ownerLabel : String -> String
-ownerLabel owner =
-    case owner of
-        "Rolando" ->
-            "Rolo"
-
-        "dot" ->
-            "Dot"
-
-        _ ->
-            owner
-
-
-ownerHeading : String -> Html Msg
+ownerHeading : Owner -> Html Msg
 ownerHeading owner =
     th
         [ scope "col"
         , class
-            ((case owner of
-                "Rolando" ->
-                    "w-10"
+            ((if owner == Dot then
+                "w-8"
 
-                "dot" ->
-                    "w-8"
-
-                _ ->
-                    "w-10"
+              else
+                "w-10"
              )
                 ++ " border-b border-slate-200 py-2 text-center text-sm font-medium text-slate-600"
             )
         ]
-        [ text (ownerLabel owner) ]
+        [ text (Domain.ownerLabel owner) ]
 
 
-ownerCell : SaveState -> User -> Editor -> Process -> Task -> String -> Html Msg
-ownerCell saving user editor process task column =
-    let
-        group =
-            if task.owner == "dot" || task.owner == "Rolando" then
-                task.owner
-
-            else
-                "Otros"
-    in
+ownerCell : SaveState -> User -> Board -> Editor -> Process -> Task -> Owner -> Html Msg
+ownerCell saving user board editor process task owner =
     td [ class "border-b border-slate-100 py-1 text-center align-top" ]
-        [ if column /= group then
-            text ""
+        [ if List.member owner (Domain.taskOwners task) then
+            fieldBox saving user board editor process task owner
 
           else
-            div []
-                [ fieldBox saving user editor process task CompletionBox
-                , if column == "Otros" then
-                    p [ class "break-words text-sm leading-tight", Attr.style "overflow-wrap" "anywhere" ] [ text task.owner ]
-
-                  else
-                    text ""
-                ]
+            text ""
         ]
 
 
-type alias Control =
-    { checked : Bool
-    , blocked : Bool
-    , review : Review
-    , toggle : TaskChange
-    , label : String
-    }
+hasLinkedPending : Board -> Process -> Task -> Owner -> Bool
+hasLinkedPending board process task owner =
+    Domain.linkedPending process.id task.id owner board
+        |> Maybe.map (\pending -> not pending.deleted)
+        |> Maybe.withDefault False
 
 
-fieldBox : SaveState -> User -> Editor -> Process -> Task -> Checkbox -> Html Msg
-fieldBox saving user editor process task box =
+sendBox : SaveState -> Board -> Editor -> Process -> Task -> Html Msg
+sendBox saving board editor process task =
     let
-        control =
-            boxControl process task box
+        current =
+            Domain.taskState task.id process
+
+        incomplete =
+            Domain.taskOwners task
+                |> List.filter (\owner -> (Domain.ownerState owner current).completion /= Done)
+
+        hasCopies =
+            List.any (hasLinkedPending board process task) (Domain.taskOwners task)
+
+        unavailable =
+            process.status
+                == CompletedProcess
+                || (not hasCopies && (current.applicability == NotApplicable || List.isEmpty incomplete))
+
+        explanation =
+            if process.status == CompletedProcess then
+                "Proceso completado: solo lectura."
+
+            else if hasCopies then
+                "Desmarca para mover las copias abiertas a Descartados y desvincular las completadas, conservándolas en Completados. El cumplimiento del proceso no cambia."
+
+            else if current.applicability == NotApplicable then
+                "Actividad cancelada: restaura antes de crear pendientes."
+
+            else if List.isEmpty incomplete then
+                "Todos los responsables terminaron esta actividad."
+
+            else
+                "Crea o recupera un pendiente por cada responsable incompleto, sin duplicar los existentes."
+
+        description =
+            "Copias en Pendientes: " ++ process.fields.client ++ ": " ++ task.label ++ ". " ++ explanation
+    in
+    label [ class "inline-flex min-h-8 w-full items-center justify-center", Attr.title description ]
+        [ input
+            [ type_ "checkbox"
+            , class "h-4 w-4 accent-indigo-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            , checked hasCopies
+            , disabled (saving == Saving || editor /= Browsing || unavailable)
+            , attribute "aria-label" description
+            , onCheck
+                (\isChecked ->
+                    if isChecked then
+                        SendTask (Domain.ref process) task.id
+
+                    else
+                        WithdrawTask (Domain.ref process) task.id
+                )
+            ]
+            []
+        ]
+
+
+cancelCell : SaveState -> User -> Editor -> Process -> Task -> Html Msg
+cancelCell saving user editor process task =
+    let
+        current =
+            Domain.taskState task.id process
+
+        excluded =
+            isExcluded current.applicability
 
         reviewNeeded =
-            control.review == NeedsReview user
+            current.applicabilityReview == NeedsReview user
+
+        change =
+            if reviewNeeded then
+                Acknowledge ApplicabilityBox
+
+            else if excluded then
+                RestoreTask
+
+            else
+                ExcludeTask
+
+        description =
+            (if excluded then
+                "Restaurar actividad: "
+
+             else
+                "Cancelar actividad: "
+            )
+                ++ process.fields.client
+                ++ ": "
+                ++ task.label
+                ++ ". Cancelar descarta los pendientes abiertos vinculados y conserva los completados."
+                ++ (if process.status == CompletedProcess then
+                        " Proceso completado: solo lectura."
+
+                    else
+                        ""
+                   )
+                ++ (if reviewNeeded && process.status == CompletedProcess then
+                        " Se conserva el aviso de cambio pendiente de revisar."
+
+                    else if reviewNeeded then
+                        " Cambio de otro usuario pendiente de revisar. El primer clic lo reconoce sin cambiar el estado."
+
+                    else
+                        ""
+                   )
+    in
+    td [ class "border-b border-slate-100 py-1 text-center align-top" ]
+        [ button
+            [ type_ "button"
+            , class "inline-flex h-8 w-8 items-center justify-center gap-0.5 rounded text-slate-600 hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600 disabled:opacity-50"
+            , disabled (saving == Saving || editor /= Browsing || process.status == CompletedProcess || (not task.allowNotApplicable && not reviewNeeded))
+            , Attr.title description
+            , attribute "aria-label" description
+            , onClick (ChangeStatus (Domain.ref process) task.id change)
+            ]
+            [ span [ attribute "aria-hidden" "true" ]
+                [ text
+                    (if excluded then
+                        "↶"
+
+                     else
+                        "×"
+                    )
+                ]
+            , reviewMark user current.applicabilityReview
+            ]
+        ]
+
+
+fieldBox : SaveState -> User -> Board -> Editor -> Process -> Task -> Owner -> Html Msg
+fieldBox saving user board editor process task owner =
+    let
+        current =
+            Domain.taskState task.id process
+
+        part =
+            Domain.ownerState owner current
+
+        linked =
+            hasLinkedPending board process task owner
+
+        reviewNeeded =
+            part.review == NeedsReview user
 
         action =
             ChangeStatus (Domain.ref process) task.id
 
         interaction =
             if reviewNeeded then
-                -- Prevent the browser's checkbox toggle on the acknowledgement click.
-                preventDefaultOn "click" (Decode.succeed ( action (Acknowledge box), True ))
+                -- Acknowledgement must not toggle the browser's checkbox.
+                preventDefaultOn "click" (Decode.succeed ( action (Acknowledge (CompletionBox owner)), True ))
 
             else
-                onCheck (\_ -> action control.toggle)
+                onCheck
+                    (\_ ->
+                        action
+                            (SetCompletion owner
+                                (if part.completion == Done then
+                                    Todo
+
+                                 else
+                                    Done
+                                )
+                            )
+                    )
 
         description =
-            control.label
+            "Cumplimiento de "
+                ++ Domain.ownerLabel owner
+                ++ ". "
                 ++ process.fields.client
                 ++ ": "
                 ++ task.label
-                ++ (if reviewNeeded && process.status == CompletedProcess then
-                        ". Proceso completado: se conserva el aviso de cambio pendiente de revisar. Solo lectura."
+                ++ (if process.status == CompletedProcess then
+                        ". Proceso completado: solo lectura."
+
+                    else
+                        ""
+                   )
+                ++ (if linked then
+                        ". Pendiente vinculado: gestionar cumplimiento y reapertura desde Pendientes."
+
+                    else
+                        ""
+                   )
+                ++ (if reviewNeeded && not linked && process.status /= CompletedProcess then
+                        ". Cambio de otro usuario pendiente de revisar. Pulsa para reconocer sin cambiar la casilla."
 
                     else if reviewNeeded then
-                        ". Cambio de otro usuario pendiente de revisar. Pulsa para reconocer sin cambiar la casilla."
+                        ". Se conserva el aviso de cambio pendiente de revisar."
 
                     else
                         ""
                    )
     in
-    label [ class "inline-flex min-h-8 w-full items-center justify-center gap-0.5" ]
+    label [ class "inline-flex min-h-8 w-full items-center justify-center gap-0.5", Attr.title description ]
         [ input
             [ type_ "checkbox"
             , class "h-4 w-4 shrink-0 accent-indigo-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
-            , checked control.checked
-            , disabled (saving == Saving || editor /= Browsing || process.status == CompletedProcess || (control.blocked && not reviewNeeded))
+            , checked (part.completion == Done)
+            , disabled (saving == Saving || editor /= Browsing || process.status == CompletedProcess || linked || (isExcluded current.applicability && not reviewNeeded))
             , attribute "aria-label" description
             , interaction
             ]
             []
-        , if reviewNeeded then
-            span
-                [ class "text-sm font-bold leading-none text-amber-700"
-                , attribute "aria-hidden" "true"
-                , Attr.title
-                    (if process.status == CompletedProcess then
-                        "Cambio pendiente de revisar conservado; proceso de solo lectura."
-
-                     else
-                        "Cambio pendiente de revisar."
-                    )
-                ]
-                [ text "!" ]
-
-          else
-            text ""
+        , reviewMark user part.review
         ]
 
 
-boxControl : Process -> Task -> Checkbox -> Control
-boxControl process task box =
-    let
-        current =
-            Domain.taskState task.id process
+reviewMark : User -> Review -> Html Msg
+reviewMark user review =
+    if review == NeedsReview user then
+        span
+            [ class "text-sm font-bold leading-none text-amber-700"
+            , attribute "aria-hidden" "true"
+            , Attr.title "Cambio pendiente de revisar."
+            ]
+            [ text "!" ]
 
-        completion =
-            case current.applicability of
-                Applicable state ->
-                    state
-
-                NotApplicable state ->
-                    state
-
-        excluded =
-            isExcluded current.applicability
-    in
-    case box of
-        ApplicabilityBox ->
-            { checked = excluded
-            , blocked = not task.allowNotApplicable
-            , review = current.applicabilityReview
-            , toggle =
-                if excluded then
-                    RestoreTask
-
-                else
-                    ExcludeTask
-            , label = "No aplica. "
-            }
-
-        CompletionBox ->
-            { checked = completion == Done
-            , blocked = excluded
-            , review = current.completionReview
-            , toggle =
-                SetCompletion
-                    (if completion == Done then
-                        Todo
-
-                     else
-                        Done
-                    )
-            , label = "Confirmado por " ++ ownerLabel task.owner ++ ". "
-            }
+    else
+        text ""
 
 
 isExcluded : Applicability -> Bool
 isExcluded applicability =
-    case applicability of
-        Applicable _ ->
-            False
-
-        NotApplicable _ ->
-            True
+    applicability == NotApplicable
 
 
 taskName : Tooltip -> Process -> Task -> Html Msg
@@ -1274,8 +1372,8 @@ taskName tooltip process task =
             )
             [ text task.label ]
         , if visible then
-            -- Owner and notes columns total 9.5rem; keep the tooltip inside the card.
-            div [ class "absolute left-0 top-full z-30 pt-1", Attr.style "width" "calc(100% + 9.5rem)" ]
+            -- Owner, notes and cancellation columns total 12rem; stay inside the card.
+            div [ class "absolute left-0 top-full z-30 pt-1", Attr.style "width" "calc(100% + 12rem)" ]
                 [ div
                     [ id descriptionId
                     , attribute "role" "tooltip"

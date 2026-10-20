@@ -4,7 +4,7 @@ import Bitwise
 import Browser.Dom
 import Browser.Events
 import Dict
-import Domain exposing (Board, Change(..), Completion(..), CompletionEdit(..), Owner(..), PendingContent(..), PendingFields, PendingMove(..), PendingStatus(..), Ref, Review(..), SaveState(..), Target(..), User)
+import Domain exposing (Board, Change(..), Completion(..), CompletionEdit(..), Owner(..), PendingContent(..), PendingFields, PendingMove(..), PendingOrigin(..), PendingStatus(..), Ref, Review(..), SaveState(..), Target(..), User)
 import Html exposing (Html)
 import Html.Attributes as A
 import Html.Events as E
@@ -70,6 +70,7 @@ type alias Draft =
     , shift : String
     , orderRevision : Int
     , completion : CompletionEdit
+    , origin : PendingOrigin
     }
 
 
@@ -92,7 +93,7 @@ type Msg
     | Edit String
     | ContentChanged String
     | KindChanged String
-    | OwnerChanged String
+    | OwnerChanged Owner
     | ShiftChanged String
     | CompletionChanged String
     | Save
@@ -306,10 +307,18 @@ updateReady msg board model =
             editDraft { draft | content = changeContent content draft.content } model
 
         ( KindChanged kind, Editing draft ) ->
-            editDraft { draft | content = changeKind kind draft.content, completion = KeepCompletion } model
+            if draft.origin == Standalone then
+                editDraft { draft | content = changeKind kind draft.content, completion = KeepCompletion } model
+
+            else
+                failure "Un pendiente vinculado a un proceso no puede convertirse en separador." model
 
         ( OwnerChanged owner, Editing draft ) ->
-            editDraft { draft | owner = parseOwner owner } model
+            if draft.origin == Standalone then
+                editDraft { draft | owner = owner } model
+
+            else
+                failure "El responsable de este pendiente está definido por la actividad del proceso." model
 
         ( ShiftChanged shift, Editing draft ) ->
             editDraft { draft | shift = shift } model
@@ -411,7 +420,7 @@ updateReady msg board model =
 newDraft : DraftContent -> Board -> Model -> ( Model, Maybe Change )
 newDraft content board model =
     ( { model
-        | ui = Editing { target = Adding, content = content, owner = Rolando, shift = "0", orderRevision = board.pendingOrderRevision, completion = KeepCompletion }
+        | ui = Editing { target = Adding, content = content, owner = Rolando, shift = "0", orderRevision = board.pendingOrderRevision, completion = KeepCompletion, origin = Standalone }
         , filter = ActiveItems
         , error = Nothing
         , submitting = Idle
@@ -438,6 +447,7 @@ draftFrom board item =
     , shift = "0"
     , orderRevision = board.pendingOrderRevision
     , completion = KeepCompletion
+    , origin = item.origin
     }
 
 
@@ -558,8 +568,9 @@ refreshDraft board draft =
                             | target =
                                 Saved (Domain.ref current) (recordState current)
                             , orderRevision = board.pendingOrderRevision
+                            , origin = current.origin
                             , owner =
-                                if Domain.pendingCompletion current.fields.content == Just Done then
+                                if current.origin /= Standalone || Domain.pendingCompletion current.fields.content == Just Done then
                                     current.fields.owner
 
                                 else
@@ -672,17 +683,22 @@ recordState item =
         Active
 
 
-parseOwner : String -> Owner
-parseOwner owner =
-    case owner of
-        "Dot" ->
-            Dot
 
-        "Otros" ->
-            Others
+-- Convert DOM text at the boundary; an unknown value must not assign Rolo.
 
-        _ ->
-            Rolando
+
+ownerInput : Decode.Decoder Msg
+ownerInput =
+    E.targetValue
+        |> Decode.andThen
+            (\value ->
+                case List.filter (\owner -> Domain.ownerLabel owner == value) [ Rolando, Dot, Others ] |> List.head of
+                    Just owner ->
+                        Decode.succeed (OwnerChanged owner)
+
+                    Nothing ->
+                        Decode.fail "Responsable no reconocido."
+            )
 
 
 failure : String -> Model -> ( Model, Maybe Change )
@@ -1201,7 +1217,7 @@ editorView state error submission draft =
                     (Html.input [ A.id "pending-content", A.class inputClass, A.value content, A.placeholder "- - -", A.maxlength 90, A.disabled (fieldState == Saving), E.onInput ContentChanged ] [])
         , field "pending-owner"
             "Responsable"
-            (Html.select [ A.id "pending-owner", A.class inputClass, A.value (Domain.ownerLabel draft.owner), A.disabled (fieldState == Saving || wasDone), E.onInput OwnerChanged ]
+            (Html.select [ A.id "pending-owner", A.class inputClass, A.value (Domain.ownerLabel draft.owner), A.disabled (fieldState == Saving || wasDone || draft.origin /= Standalone), E.on "input" ownerInput ]
                 (List.map (\owner -> Html.option [ A.value (Domain.ownerLabel owner) ] [ Html.text (Domain.ownerLabel owner) ]) [ Rolando, Dot, Others ])
             )
         , completionField fieldState draft
@@ -1210,7 +1226,11 @@ editorView state error submission draft =
 
           else
             editorOptions fieldState draft
-        , if wasDone && not (isReadOnly draft) then
+        , if draft.origin /= Standalone then
+            Html.p [ A.class "text-sm text-slate-600" ]
+                [ Html.text "Vinculado a una actividad de proceso. Su responsable y tipo son fijos; puedes editar el texto. Al confirmar su cumplimiento se marca su casilla en el proceso; reabrirlo la desmarca." ]
+
+          else if wasDone && not (isReadOnly draft) then
             Html.p [ A.class "text-sm text-slate-600" ]
                 [ Html.text "Para cambiar el responsable o el tipo, primero guarda el estado Pendiente." ]
 
@@ -1261,7 +1281,7 @@ editorOptions state draft =
                 [ A.id "pending-kind"
                 , A.class inputClass
                 , A.value (contentKind draft.content)
-                , A.disabled (state == Saving || Domain.pendingCompletion (draftFields draft).content == Just Done)
+                , A.disabled (state == Saving || draft.origin /= Standalone || Domain.pendingCompletion (draftFields draft).content == Just Done)
                 , E.onInput KindChanged
                 ]
                 [ Html.option [ A.value "task" ] [ Html.text "Pendiente" ]

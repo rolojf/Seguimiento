@@ -16,8 +16,9 @@ El contador de la plantilla se sustituyó por el tablero:
 - Mapa 5×5 de oportunidades y responsabilidades, filtros Ventex/Contratista,
   calificaciones, posición por arrastre o teclado, notas, fuente, validación,
   edición, descarte, sugerencias de completado y archivo de completadas.
-- Procesos Nueva OTI y Entregas con sus 17 y 23 tareas, responsables, avance,
-  confirmación, N/A reversible, notas y vista de completados. Evidencia, cierre
+- Procesos Nueva OTI y Entregas con sus 17 y 23 tareas, varios responsables por
+  tarea, cumplimiento independiente, envío a Pendientes, cancelación reversible,
+  notas y vista de completados. Evidencia, cierre
   personal e historial se conservan sin confundir cierre con tareas completadas.
 - Pendientes agrupados por Rolo, Dot y Otros, con aprobación, confirmación del
   cumplimiento, orden manual y separadores en blanco o con texto.
@@ -40,23 +41,58 @@ Tipo y posición siguen disponibles en «Más opciones» después de los botones
 
 Los procesos se distribuyen en dos columnas en pantalla ancha y una en móvil.
 La explicación de cada tarea aparece al pasar el puntero, enfocar o tocar su
-nombre. N/A tiene su propia columna; las tareas excluidas aparecen grises y
-tachadas. Se retiraron los comentarios de N/A, incluidos los anteriores.
+nombre. La casilla inicial «Pend» crea un pendiente por cada responsable que
+aún no termina. El texto de las nuevas copias incluye cliente, tipo de proceso y
+actividad separados por espacios, sin diagonales; se puede editar sin perder el
+vínculo: la relación usa los identificadores del proceso y del paso, no el texto.
+Repetir el envío no duplica pendientes; los descartados se recuperan con la
+aprobación inicial correspondiente.
 
-Cada casilla de proceso conserva por separado quién debe revisar el último
-cambio. Si `Rolo` la cambia, `Dot` ve «!»: su primer clic confirma
-la revisión sin cambiar el valor; el siguiente clic modifica el valor y avisa
-a `Rolo`. Reconocer un cambio no produce otro aviso. Estos datos se guardan
-en Lamdera, también al cerrar sesión. Las columnas Rolo, Dot y Otros indican
-responsables de tareas.
+«Pend» queda marcada mientras haya alguna copia vinculada no descartada, también
+si ya pasó a Completados. Desmarcarla mueve las copias abiertas a Descartados y
+desvincula las completadas sin cambiar su estado ni fecha de completado. El
+cumplimiento y los avisos del proceso se conservan. Volver a marcar recupera las
+partes que aún falten; no vuelve a copiar las ya completadas. Las descripciones
+anteriores se conservan, ya que pueden haber sido editadas.
+
+Cada tarea define `owner : List Owner` en `src/Domain.elm`, reutilizando
+`Rolando | Dot | Others`; por ejemplo, `owner = [ Rolando, Dot ]`. Las plantillas
+conservan sus asignaciones anteriores como listas de un elemento. Los nombres de
+responsables externos, como Compras o Lidia, quedan en el detalle de la actividad.
+Las columnas Rolo, Dot y Otros muestran hasta tres casillas independientes. El
+avance cuenta la tarea completa solo cuando todos sus responsables terminan.
+
+Las partes enviadas se completan o reabren desde Pendientes, respetando su
+aprobación y confirmación de cumplimiento: marcar un pendiente que aún necesita
+revisión no completa todavía su parte del proceso. Al confirmarse definitivamente,
+el backend marca solo la casilla de ese responsable; reabrirlo la desmarca. No se
+pide una segunda revisión en Procesos. Mientras el vínculo esté activo, la casilla
+del proceso refleja ese estado y no se edita directamente. El pendiente vinculado
+admite cambios de texto y orden, pero no de responsable ni conversión en separador.
+
+Las partes no enviadas conservan el cambio directo por cualquiera de los dos
+usuarios. Cada casilla de cumplimiento tiene su propio aviso: si `Rolo` la cambia,
+`Dot` ve «!»; su primer clic reconoce sin cambiar el valor y el siguiente lo cambia
+y avisa a `Rolo`. Reconocer no produce otro aviso. Los estados y revisiones se
+guardan en Lamdera, también al cerrar sesión.
+
+La cancelación está al final de la fila, junto a Notas, mediante un botón X.
+Es reversible y tiene su propio aviso de revisión. Excluye la actividad del avance,
+la muestra gris y tachada, descarta sus pendientes vinculados todavía abiertos y
+conserva los completados. Restaurar la actividad no restaura automáticamente esos
+pendientes: «Pend» permite recuperarlos. Los pendientes de una actividad cancelada
+no se pueden restaurar ni reabrir hasta restaurarla. No se conservan comentarios N/A.
 
 Solo Rolo puede mover un proceso a «Completados», mediante un botón con
-confirmación. El proceso conserva todos sus pasos y notas, visibles en modo
-consulta para ambos usuarios. Desde esa vista, Rolo puede borrarlo definitivamente
+confirmación y siempre que no queden pendientes vinculados activos sin finalizar.
+El proceso conserva todos sus pasos y notas, visibles en modo consulta para ambos
+usuarios. No se pueden reabrir sus pendientes vinculados mientras esté completado. Desde esa vista, Rolo puede borrarlo definitivamente
 con una segunda confirmación. El backend exige tanto el usuario como el estado
-correctos. Completar un proceso no cambia automáticamente sus casillas.
+correctos. Completar un proceso no cambia automáticamente sus casillas. Borrarlo
+desvincula los pendientes conservados, sin borrarlos. Borrar un pendiente no revierte
+el cumplimiento ya registrado en el proceso.
 
-La última columna de cada paso abre sus notas en un modal. El ícono distingue
+La columna Notas, junto al botón de cancelación, abre las notas del paso en un modal. El ícono distingue
 entre notas vacías y notas con contenido. Ambos usuarios pueden guardar o vaciar
 las notas de procesos activos; se conservan hasta 10000 caracteres por paso.
 
@@ -317,7 +353,7 @@ respaldo compatible. El archivo local disponible es una instantánea del 14 de
 octubre de 2026, no una lectura del sitio actual.
 
 El backend acepta `seguimiento-d1-backup`, versión 1, y
-`seguimiento-lamdera-backup`, versiones 2 y 3, hasta 5 MB. Comprueba todas las tablas
+`seguimiento-lamdera-backup`, versiones 2, 3 y 4, hasta 5 MB. Comprueba todas las tablas
 y filas antes de modificar el estado.
 Solo permite importar sobre un tablero vacío y sin historial previo; no reemplaza
 datos existentes. Se conservan identificadores, versiones, fechas, posiciones,
@@ -326,10 +362,14 @@ Las tablas antiguas `checks` y `process_snapshots` se guardan como archivo hist�
 en el backend, no se convierten en tareas activas duplicadas.
 
 «Descargar respaldo» exporta las cinco tablas, incluido ese archivo histórico,
-en el formato Lamdera versión 3. Este conserva el tipo, posición, aprobación y
-confirmación de cumplimiento de cada pendiente, las notas y estado de cada proceso,
+en el formato Lamdera versión 4. Este conserva el tipo, posición, aprobación y
+confirmación de cumplimiento de cada pendiente, su vínculo con una actividad,
+el cumplimiento por responsable de cada tarea, las notas y estado de cada proceso,
 el estado y sugerencias de completado del mapa, y el siguiente identificador,
-incluso después de borrar filas. No es
+incluso después de borrar filas. La importación valida que los vínculos existan,
+no estén duplicados y concuerden con los responsables y cumplimientos. Los formatos
+anteriores se importan sin vínculos y su cumplimiento único se aplica a los
+responsables de la plantilla actual. No es
 un archivo para restaurar directamente en la aplicación JavaScript anterior.
 No incluye claves, sesiones ni avisos de revisión de oportunidades o casillas de
 procesos; esos avisos se consideran ya revisados al importar. Sí conserva el flujo
@@ -350,7 +390,7 @@ de tipos, conserva también una exportación JSON desde «Descargar respaldo».
 
 - `src/Domain.elm`: datos tipados, mensajes del tablero y plantillas de tareas.
 - `src/BoardStore.elm`: validación y cambios de estado con control de versiones.
-- `src/Backup.elm`: importación de respaldos D1 v1 y Lamdera v2/v3; exportación v3.
+- `src/Backup.elm`: importación de respaldos D1 v1 y Lamdera v2/v3/v4; exportación v4.
 - `src/Opportunities.elm`, `src/Processes.elm`, `src/Pending.elm`: vistas y
   formularios de cada sección, con Tailwind.
 - `src/Dashboard.elm`: reúne esas tres secciones y sus avisos de guardado.
@@ -375,12 +415,21 @@ teclado con los botones existentes de Elm.
 npm run check
 ```
 
-Frontend y backend compilan con el tablero integrado; también se generó el CSS.
+Para este cambio se comprobó la compilación conjunta sin iniciar el servidor:
+
+```sh
+ELM_HOME="$PWD/node_modules/.cache/elm" lamdera make src/Frontend.elm src/Backend.elm --output=/dev/null
+npm run build:css
+```
+
 Por indicación del usuario, no se añadieron tests ni se ejecutaron pruebas del
-tablero. La revisión de reglas y autorización fue estática. Durante este cambio
-de formato se recuperaron los cuatro pendientes de desarrollo mediante el
-importador local; la exportación posterior conservó su contenido, responsables,
-fechas, versiones y cumplimiento. No se probaron los flujos nuevos de la interfaz.
+tablero. La revisión de reglas, autorización y vínculos fue estática; no se probaron
+los flujos nuevos de la interfaz en navegador ni se modificaron datos locales.
+El nuevo `TaskState` y el origen de pendientes cambian el modelo persistido; un
+snapshot local anterior no constituye una migración al nuevo formato. Para datos
+que deban conservarse se requiere exportar JSON con el código anterior e importarlo
+sobre un tablero vacío con el nuevo. En este cambio el usuario indicó que no
+necesita conservar los datos locales anteriores.
 
 El remoto `lamdera` está asociado a `seguimiento`. La consulta pública de versión
 indica `v = 0`: todavía no hay un primer despliegue. `lamdera check` compila y
